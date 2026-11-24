@@ -505,7 +505,8 @@ struct ContentView: View {
         switch (micIsLive, systemIsLive) {
         case (false, false): return "STARTING"
         case (false, true): return "WAITING FOR MIC"
-        default: return "WAITING FOR CALL AUDIO"
+        default:
+            return transcriptionEngine?.systemAudioStopped == true ? "CALL AUDIO LOST" : "WAITING FOR CALL AUDIO"
         }
     }
 
@@ -642,14 +643,29 @@ struct ContentView: View {
             activeSessionType = .callCapture
             detectedAppName = appName
             let corrector = buildVocabularyCorrector(client: client)
-            await transcriptionEngine?.start(
+            let started = await transcriptionEngine?.start(
                 locale: settings.locale,
                 inputDeviceID: settings.inputDeviceID,
                 appBundleID: appName != nil ? bundleID : nil,
                 preferBuiltInMic: settings.preferBuiltInMicDuringCalls,
                 vocabularyCorrector: corrector
-            )
+            ) ?? false
+            if !started { await abandonFailedStart() }
         }
+    }
+
+    /// The engine refused to start (mic permission, models, ...). Close the
+    /// note it never wrote to and go back to idle, so Start works again.
+    /// The engine's error stays on screen.
+    private func abandonFailedStart() async {
+        // Stop already took over and will clean up.
+        guard !stopRequestedDuringStart else { return }
+        engineLog("[SESSION-GUARD] start failed; back to idle")
+        activeSessionType = nil
+        detectedAppName = nil
+        activeClient = nil
+        await sessionStore.endSession()
+        await transcriptLogger.discardSession()
     }
 
     private func startSession(type: SessionType) {
@@ -722,22 +738,24 @@ struct ContentView: View {
             activeSessionType = type
             detectedAppName = resolvedAppName
             let corrector = buildVocabularyCorrector(client: nil)
+            let started: Bool
             if type == .callCapture {
-                await transcriptionEngine?.start(
+                started = await transcriptionEngine?.start(
                     locale: settings.locale,
                     inputDeviceID: settings.inputDeviceID,
                     appBundleID: appBundleID,
                     preferBuiltInMic: settings.preferBuiltInMicDuringCalls,
                     vocabularyCorrector: corrector
-                )
+                ) ?? false
             } else {
-                await transcriptionEngine?.start(
+                started = await transcriptionEngine?.start(
                     locale: settings.locale,
                     inputDeviceID: settings.inputDeviceID,
                     micOnly: true,
                     vocabularyCorrector: corrector
-                )
+                ) ?? false
             }
+            if !started { await abandonFailedStart() }
         }
     }
 

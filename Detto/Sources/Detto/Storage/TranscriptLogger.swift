@@ -315,6 +315,22 @@ tags:
         }
     }
 
+    /// For a recording that never started: closes and deletes its note.
+    /// Nothing has been transcribed into it yet.
+    func discardSession() {
+        try? fileHandle?.close()
+        fileHandle = nil
+        if let currentFilePath {
+            try? FileManager.default.removeItem(at: currentFilePath)
+            engineLog("[LOGGER] discarded the note of a recording that didn't start: \(currentFilePath.lastPathComponent)")
+        }
+        currentFilePath = nil
+        sessionStartTime = nil
+        speakersDetected = []
+        sessionContext = ""
+        utteranceBuffer = []
+    }
+
     func endSession() {
         // Flush remaining buffer
         flushBuffer()

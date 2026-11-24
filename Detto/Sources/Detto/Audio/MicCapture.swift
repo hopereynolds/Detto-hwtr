@@ -1,6 +1,7 @@
 @preconcurrency import AVFoundation
 import CoreAudio
 import Foundation
+import os
 
 final class MicCapture: @unchecked Sendable {
     /// Only touched on `queue`.
@@ -10,6 +11,15 @@ final class MicCapture: @unchecked Sendable {
     private let _audioLevel = AudioLevel()
     private let _error = SyncString()
     private let _tapActive = AtomicBool()
+    /// Bumped by every bufferStream() and stop(). Setup work and tap
+    /// callbacks from an older generation do nothing, so a Stop cancels a
+    /// setup still waiting on the queue, and a retired engine's last
+    /// callbacks can't mark the mic live or move the level meter.
+    private let _generation = OSAllocatedUnfairLock<Int>(initialState: 0)
+
+    private func isCurrent(_ generation: Int) -> Bool {
+        _generation.withLock { $0 == generation }
+    }
 
     var audioLevel: Float { _audioLevel.value }
     var captureError: String? { _error.value }
@@ -20,6 +30,7 @@ final class MicCapture: @unchecked Sendable {
         let errorHolder = _error
         let tapActive = _tapActive
         tapActive.value = false
+        let generation = _generation.withLock { value -> Int in value += 1; return value }
 
         return AsyncStream { continuation in
             errorHolder.value = nil
@@ -29,6 +40,11 @@ final class MicCapture: @unchecked Sendable {
             // a Bluetooth headset), and the caller is the main thread: the
             // window froze and system audio waited behind it.
             self.queue.async {
+                guard self.isCurrent(generation) else {
+                    engineLog("[MIC-1] setup cancelled before it started (stopped)")
+                    continuation.finish()
+                    return
+                }
                 engineLog("[MIC-1] bufferStream called, deviceID=\(String(describing: deviceID))")
 
                 // Set input device before accessing inputNode format
@@ -86,8 +102,17 @@ final class MicCapture: @unchecked Sendable {
 
                 engineLog("[MIC-4] tapFormat: sr=\(tapFormat.sampleRate) ch=\(tapFormat.channelCount)")
 
+                // Opening the device can take seconds; Stop may have come in
+                // meanwhile. Don't turn the mic on for a stopped session.
+                guard self.isCurrent(generation) else {
+                    engineLog("[MIC-4] setup cancelled (stopped while opening the device)")
+                    continuation.finish()
+                    return
+                }
+
                 var tapCallCount = 0
                 inputNode.installTap(onBus: 0, bufferSize: 4096, format: tapFormat) { buffer, _ in
+                    guard self.isCurrent(generation) else { return }
                     tapCallCount += 1
                     if tapCallCount == 1 { tapActive.value = true }
                     let rms = Self.normalizedRMS(from: buffer)
@@ -117,18 +142,39 @@ final class MicCapture: @unchecked Sendable {
         }
     }
 
-    /// Stops capture. Teardown runs on `queue`, after any setup still in
+    /// Stops capture without waiting. Cancels a setup that hasn't turned
+    /// the mic on yet; teardown runs on `queue`, after any setup step in
     /// progress, so a following `bufferStream` always gets a fresh engine.
     func stop() {
+        beginStop()
+        queue.async { self.tearDown() }
+    }
+
+    /// Stops capture and returns once the engine is actually stopped.
+    func stopAndWait() async {
+        beginStop()
+        await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
+            queue.async {
+                self.tearDown()
+                done.resume()
+            }
+        }
+    }
+
+    private func beginStop() {
+        _generation.withLock { $0 += 1 }
         _audioLevel.value = 0
         _tapActive.value = false
-        queue.async {
-            let stopped = self.engine
-            stopped.inputNode.removeTap(onBus: 0)
-            stopped.stop()
-            self.engine = AVAudioEngine()
-            Self.retire(stopped)
-        }
+    }
+
+    /// Only on `queue`.
+    private func tearDown() {
+        let stopped = engine
+        stopped.inputNode.removeTap(onBus: 0)
+        stopped.stop()
+        engine = AVAudioEngine()
+        Self.retire(stopped)
+        engineLog("[MIC-STOP] engine stopped")
     }
 
     /// How long a stopped engine is kept alive before it's released.

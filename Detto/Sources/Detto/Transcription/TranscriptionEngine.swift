@@ -90,6 +90,8 @@ final class TranscriptionEngine {
     var micIsLive: Bool { micCapture.tapIsActive }
     /// Computer audio has delivered audio, or this session doesn't capture it.
     var systemIsLive: Bool { !sessionIsCallCapture || systemCapture.hasAudio }
+    /// macOS stopped the call-audio stream during this session.
+    private(set) var systemAudioStopped = false
 
     /// True while start() is still setting up. stop() waits for it, so a
     /// quick Start-then-Stop can't leave half a session running.
@@ -206,16 +208,19 @@ final class TranscriptionEngine {
         }
     }
 
-    func start(locale: Locale, inputDeviceID: AudioDeviceID = 0, appBundleID: String? = nil, micOnly: Bool = false, preferBuiltInMic: Bool = true, vocabularyCorrector: VocabularyCorrector? = nil) async {
+    /// Returns false if the session didn't start (lastError says why), so
+    /// the caller can close the note and let Start be pressed again.
+    @discardableResult
+    func start(locale: Locale, inputDeviceID: AudioDeviceID = 0, appBundleID: String? = nil, micOnly: Bool = false, preferBuiltInMic: Bool = true, vocabularyCorrector: VocabularyCorrector? = nil) async -> Bool {
         engineLog("[ENGINE-0] start() called, isRunning=\(isRunning)")
-        guard !isRunning, !isStarting else { return }
+        guard !isRunning, !isStarting else { return false }
         isStarting = true
         defer { isStarting = false }
         lastError = nil
         preferBuiltInMicDuringCalls = preferBuiltInMic
         sessionIsCallCapture = !micOnly
 
-        guard await ensureMicrophonePermission() else { return }
+        guard await ensureMicrophonePermission() else { return false }
 
         isRunning = true
         let startedAt = Date()
@@ -265,11 +270,14 @@ final class TranscriptionEngine {
                 lastError = msg
                 assetStatus = "Ready"
                 isRunning = false
-                return
+                return false
             }
         }
 
-        guard let asrEngine else { return }
+        guard let asrEngine else {
+            isRunning = false
+            return false
+        }
 
         // 2. Start mic capture
         userSelectedDeviceID = inputDeviceID
@@ -283,6 +291,10 @@ final class TranscriptionEngine {
         }
 
         // 3. Start system audio capture (skipped for mic-only mode)
+        systemAudioStopped = false
+        systemCapture.setOnStreamStopped { [weak self] error in
+            Task { @MainActor in self?.systemStreamStopped(error) }
+        }
         engineLog("[ENGINE-4] starting system audio capture...")
         let sysStreams: SystemAudioCapture.CaptureStreams?
         if micOnly {
@@ -530,6 +542,16 @@ final class TranscriptionEngine {
         watchFirstAudio(since: startedAt)
 
         installDefaultDeviceListener()
+        return true
+    }
+
+    /// macOS ended the call-audio stream. Drop LIVE and say so; the mic
+    /// keeps recording.
+    private func systemStreamStopped(_ error: any Error) {
+        guard isRunning, sessionIsCallCapture else { return }
+        engineLog("[ENGINE-SYS-LOST] call audio stream stopped: \(error.localizedDescription)")
+        systemAudioStopped = true
+        lastError = "Computer audio stopped, so the other side isn't being recorded. Your mic is still recording."
     }
 
     /// Restart only the mic capture with a new device, keeping system audio and models intact.
@@ -816,8 +838,12 @@ final class TranscriptionEngine {
         }
         isRunning = false
 
+        systemCapture.setOnStreamStopped(nil)
         await systemCapture.stop()
-        micCapture.stop()
+        // Wait for the mic to actually stop (and cancel a setup still
+        // opening the device), so nothing turns it on after Stop finishes.
+        await micCapture.stopAndWait()
+        systemAudioStopped = false
 
         micReaderTask?.cancel()
         micTranscribeTask?.cancel()

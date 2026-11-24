@@ -11,8 +11,19 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
     private let _hasAudio = AtomicBool()
 
     var audioLevel: Float { _audioLevel.value }
-    /// True once the current stream has delivered audio.
+    /// True once the current stream has delivered audio, until it stops.
     var hasAudio: Bool { _hasAudio.value }
+
+    /// Called (on a capture thread) when macOS stops the current stream
+    /// with an error, e.g. -3815. Not called for stop().
+    private let _onStreamStopped = OSAllocatedUnfairLock<(@Sendable (any Error) -> Void)?>(uncheckedState: nil)
+    func setOnStreamStopped(_ handler: (@Sendable (any Error) -> Void)?) {
+        _onStreamStopped.withLock { $0 = handler }
+    }
+
+    private func isCurrent(_ stream: SCStream) -> Bool {
+        _stream.withLock { $0 === stream }
+    }
 
     struct CaptureStreams {
         let systemAudio: AsyncStream<AVAudioPCMBuffer>
@@ -78,7 +89,7 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
     private let _sampleCount = OSAllocatedUnfairLock<Int>(uncheckedState: 0)
 
     nonisolated func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
-        guard type == .audio else { return }
+        guard type == .audio, isCurrent(stream) else { return }
         guard let formatDesc = sampleBuffer.formatDescription,
               var asbd = formatDesc.audioStreamBasicDescription else { return }
 
@@ -115,8 +126,15 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
     // MARK: - SCStreamDelegate
 
     nonisolated func stream(_ stream: SCStream, didStopWithError error: any Error) {
+        guard isCurrent(stream) else {
+            engineLog("[SYS-STOP] an old stream stopped with error (ignored): \(error)")
+            return
+        }
         engineLog("[SYS-STOP] stream stopped with error: \(error)")
+        _hasAudio.value = false
+        _audioLevel.value = 0
         _sysContinuation.withLock { $0?.finish(); $0 = nil }
+        _onStreamStopped.withLock { $0 }?(error)
     }
 
     private static func normalizedRMS(from buffer: AVAudioPCMBuffer) -> Float {
