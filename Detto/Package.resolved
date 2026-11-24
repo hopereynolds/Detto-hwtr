@@ -1,5 +1,5 @@
 {
-  "originHash" : "8dcccbc5b6c6cfca25fdf125b328934737c0d13f4f55e0cc8c32e1550c95ee2f",
+  "originHash" : "4a12e41d14aad6379d38f20abfdd2f307d24c4cf342c01a154ee7cd8f6f19287",
   "pins" : [
     {
       "identity" : "fluidaudio",
@@ -15,7 +15,7 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/Gremble-io/gremble-voice.git",
       "state" : {
-        "revision" : "139cea97f6a89a8d5c86556c93527db2efa39a8c"
+        "revision" : "149889c1efcad7a08c389f3350d4abdbf2df8de3"
       }
     },
     {
