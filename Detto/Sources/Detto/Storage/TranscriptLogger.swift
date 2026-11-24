@@ -69,7 +69,7 @@ actor TranscriptLogger {
         var pendingPath: String?
     }
 
-    private struct Journal {
+    struct Journal {
         let url: URL
         var record: InProgressRecord
         var recordingID: String { url.deletingPathExtension().lastPathComponent }
@@ -120,27 +120,41 @@ actor TranscriptLogger {
     private static func publishedNote(of journal: Journal) -> URL? {
         guard let pending = journal.record.pendingPath,
               let content = try? String(contentsOfFile: pending, encoding: .utf8),
-              content.contains(recordingLine(journal.recordingID)) else { return nil }
+              isOwnNote(content, of: journal) else { return nil }
         return URL(fileURLWithPath: pending)
     }
 
-    /// Whether a note is this recording's: it carries the recording's ID.
-    /// A note from before IDs existed (no `detto_recording` line at all)
-    /// counts by path; the recovered copy gets the ID.
-    private static func isOwnNote(_ content: String, of journal: Journal) -> Bool {
-        content.contains(recordingLine(journal.recordingID)) || !content.contains("detto_recording:")
+    /// Whether a note is this recording's: its frontmatter carries exactly
+    /// this recording's ID. Nothing else counts, so recovery never deletes
+    /// or rewrites a note it can't prove is its own.
+    static func isOwnNote(_ content: String, of journal: Journal) -> Bool {
+        guard content.hasPrefix("---\n"),
+              let end = content.range(of: "\n---\n", range: content.index(content.startIndex, offsetBy: 4)..<content.endIndex) else { return false }
+        let frontmatter = content[content.startIndex..<end.lowerBound]
+        return frontmatter.split(separator: "\n").contains { $0 == recordingLine(journal.recordingID) }
     }
 
     enum NoteState { case present, missing, inaccessible }
 
-    /// Missing only if its folder can be listed and the note isn't in it;
-    /// a folder macOS won't let us read (or that's gone, like an unplugged
+    /// Present if macOS can open it at the recorded path (whatever the
+    /// folder's case rules). Missing only if macOS says there's no such
+    /// file and its folder can be read; anything else (denied, unplugged
     /// drive) is inaccessible, so its recovery data is kept.
     static func noteState(_ note: URL) -> NoteState {
-        guard let names = try? FileManager.default.contentsOfDirectory(atPath: note.deletingLastPathComponent().path) else {
-            return .inaccessible
+        do {
+            let handle = try FileHandle(forReadingFrom: note)
+            try? handle.close()
+            return .present
+        } catch let error as NSError {
+            let noSuchFile = (error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError)
+                || (error.domain == NSPOSIXErrorDomain && error.code == Int(ENOENT))
+                || ((error.userInfo[NSUnderlyingErrorKey] as? NSError).map { $0.domain == NSPOSIXErrorDomain && $0.code == Int(ENOENT) } ?? false)
+            guard noSuchFile,
+                  (try? FileManager.default.contentsOfDirectory(atPath: note.deletingLastPathComponent().path)) != nil else {
+                return .inaccessible
+            }
+            return .missing
         }
-        return names.contains(note.lastPathComponent) ? .present : .missing
     }
 
     /// Before a save publishes the renamed note, note where it's going, so
@@ -160,6 +174,8 @@ actor TranscriptLogger {
         var recovered: [URL] = []
         /// Notes that still couldn't be saved; tried again next launch.
         var failed = 0
+        /// Notes recovery couldn't confirm were its own; left untouched.
+        var needsManualCheck: [URL] = []
     }
 
     /// Finishes notes whose recording ended without a save (the app quit,
@@ -218,10 +234,12 @@ actor TranscriptLogger {
                 continue
             }
             guard isOwnNote(content, of: journal) else {
-                // Something else now lives at that path. Leave it alone and
-                // keep the record (and audio) rather than guess.
-                engineLog("[RECOVER] \(note.lastPathComponent) belongs to another recording; leaving it and keeping the record")
-                result.failed += 1
+                // Can't prove it's this recording's (another note, or one
+                // from before recording IDs). Leave it alone and set the
+                // record aside, with its audio, for checking by hand.
+                engineLog("[RECOVER] can't confirm \(note.lastPathComponent) is this recording's; leaving it and setting the record aside as .manual")
+                try? FileManager.default.moveItem(at: file, to: file.appendingPathExtension("manual"))
+                result.needsManualCheck.append(note)
                 continue
             }
             let lastWrite = (try? FileManager.default.attributesOfItem(atPath: note.path)[.modificationDate] as? Date) ?? record.startedAt
@@ -232,7 +250,6 @@ actor TranscriptLogger {
                 speakers: speakerNames(inTranscriptOf: content),
                 context: record.context,
                 notice: recoveredNotice,
-                recordingID: journal.recordingID,
                 willPublish: pendingWriter(for: journal)
             )
             if let saved {
@@ -263,7 +280,7 @@ actor TranscriptLogger {
         }
         var names: Set<String> = []
         for file in files {
-            // "<id>.json" or "<id>.json.bad"
+            // "<id>.json", "<id>.json.bad" or "<id>.json.manual"
             let id = file.lastPathComponent.components(separatedBy: ".").first ?? ""
             if !id.isEmpty { names.insert("\(id).raw") }
             if let data = try? Data(contentsOf: file),
@@ -665,17 +682,9 @@ tags:
         speakers: Set<String>,
         context: String,
         notice: String? = nil,
-        recordingID: String? = nil,
         willPublish: (@Sendable (URL) -> Bool)? = nil
     ) async -> URL? {
         guard var content = try? String(contentsOf: filePath, encoding: .utf8) else { return nil }
-
-        // A note from before recording IDs: add it, so another interrupted
-        // save of this copy can be recognized.
-        if let recordingID, !content.contains("detto_recording:"),
-           let version = content.range(of: #"detto_version: ".*"\n"#, options: .regularExpression) {
-            content.insert(contentsOf: recordingLine(recordingID) + "\n", at: version.upperBound)
-        }
 
         // Calculate duration
         let elapsed = endTime.timeIntervalSince(startTime)

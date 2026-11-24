@@ -99,7 +99,10 @@ struct ContentView: View {
                 savedFileWasRecovered = true
                 savedFileURL = last
             }
-            if recovery.failed > 0, idle, transcriptionEngine?.lastError == nil {
+            if let unsure = recovery.needsManualCheck.first, idle, transcriptionEngine?.lastError == nil {
+                engineLog("[RECOVER] needs a manual check: \(recovery.needsManualCheck.map(\.path))")
+                transcriptionEngine?.lastError = "\(AppPaths.displayName) left \(unsure.lastPathComponent) untouched because it couldn't confirm it was the unfinished recording. Check that note by hand."
+            } else if recovery.failed > 0, idle, transcriptionEngine?.lastError == nil {
                 transcriptionEngine?.lastError = recovery.failed == 1
                     ? "A note from an earlier recording couldn't be finished. \(AppPaths.displayName) will try again next time it opens."
                     : "\(recovery.failed) notes from earlier recordings couldn't be finished. \(AppPaths.displayName) will try again next time it opens."

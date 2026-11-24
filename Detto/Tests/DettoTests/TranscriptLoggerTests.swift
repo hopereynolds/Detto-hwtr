@@ -288,10 +288,15 @@ final class TranscriptLoggerTests: XCTestCase {
 
         let result = await TranscriptLogger.recoverInterruptedRecordings(startedBefore: Date().addingTimeInterval(1), journalDirectory: journal)
         XCTAssertEqual(result.recovered, [])
-        XCTAssertEqual(result.failed, 1)
+        XCTAssertEqual(result.failed, 0)
+        XCTAssertEqual(result.needsManualCheck, [original])
         XCTAssertEqual(try String(contentsOf: original, encoding: .utf8), other)
-        XCTAssertEqual(journalEntries().count, 1)
+        XCTAssertEqual(journalEntries().count, 0)
+        let setAside = try FileManager.default.contentsOfDirectory(atPath: journal.path).filter { $0.hasSuffix(".json.manual") }
+        XCTAssertEqual(setAside.count, 1)
         XCTAssertTrue(FileManager.default.fileExists(atPath: audio.path))
+        let kept = try XCTUnwrap(TranscriptLogger.audioNamesInProgress(journalDirectory: journal))
+        XCTAssertTrue(kept.contains(audio.lastPathComponent))
     }
 
     /// A notes folder that can't be read isn't mistaken for a deleted note.
@@ -311,21 +316,69 @@ final class TranscriptLoggerTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: audio.path))
     }
 
-    /// A note from before recording IDs gets one when it's recovered.
-    func testRecoveredLegacyNoteGetsItsID() async throws {
+    /// A note without this recording's ID (an ordinary note, or one from
+    /// before IDs) is never rewritten or deleted; the record and audio are
+    /// set aside for a manual check.
+    func testNoteWithoutTheIDIsLeftAlone() async throws {
         let logger = makeLogger()
-        try await logger.startSession(sourceApp: "Call", vaultPath: directory.path)
+        try await logger.startSession(sourceApp: "Call", vaultPath: directory.path, context: "Design sync")
+        let audio = try await makeAudioFile(for: logger)
         await logger.endSession()
-        let id = try recordFile().deletingPathExtension().lastPathComponent
         let note = URL(fileURLWithPath: try readRecord().notePath)
-        let legacy = try String(contentsOf: note, encoding: .utf8)
-            .replacingOccurrences(of: "detto_recording: \"\(id)\"\n", with: "")
-        XCTAssertFalse(legacy.contains("detto_recording"))
-        try legacy.write(to: note, atomically: true, encoding: .utf8)
+        let plain = "# Just a note\nnothing to do with Detto"
+        try plain.write(to: note, atomically: true, encoding: .utf8)
 
         let result = await TranscriptLogger.recoverInterruptedRecordings(startedBefore: Date().addingTimeInterval(1), journalDirectory: journal)
-        let saved = try XCTUnwrap(result.recovered.first)
-        XCTAssertTrue(try String(contentsOf: saved, encoding: .utf8).contains("detto_recording: \"\(id)\""))
+        XCTAssertEqual(result.recovered, [])
+        XCTAssertEqual(result.needsManualCheck, [note])
+        XCTAssertEqual(try String(contentsOf: note, encoding: .utf8), plain)
+        XCTAssertEqual(try notes(), [note.lastPathComponent])
+        XCTAssertTrue(FileManager.default.fileExists(atPath: audio.path))
+        let kept = try XCTUnwrap(TranscriptLogger.audioNamesInProgress(journalDirectory: journal))
+        XCTAssertTrue(kept.contains(audio.lastPathComponent))
+    }
+
+    /// After an interrupted publish, a plain note at the original path stays.
+    func testInterruptedRenameLeavesAPlainNoteAtTheOriginalPath() async throws {
+        let logger = makeLogger()
+        try await logger.startSession(sourceApp: "Call", vaultPath: directory.path, context: "Design sync")
+        await logger.endSession()
+        var record = try readRecord()
+        let original = URL(fileURLWithPath: record.notePath)
+        let published = directory.appendingPathComponent("2026-01-01 00-00-00 Design sync.md")
+        try FileManager.default.copyItem(at: original, to: published)
+        try "plain".write(to: original, atomically: true, encoding: .utf8)
+        record.pendingPath = published.path
+        try writeRecord(record)
+
+        let result = await TranscriptLogger.recoverInterruptedRecordings(startedBefore: Date().addingTimeInterval(1), journalDirectory: journal)
+        XCTAssertEqual(result.recovered, [published])
+        XCTAssertEqual(try String(contentsOf: original, encoding: .utf8), "plain")
+    }
+
+    /// A note whose name only changed case (still opens at the recorded
+    /// path on this disk) is recovered, not treated as missing.
+    func testCaseChangedNameIsNotMissing() async throws {
+        let logger = makeLogger()
+        try await logger.startSession(sourceApp: "Call", vaultPath: directory.path)
+        await logger.append(speaker: "You", text: "still here", timestamp: Date())
+        await logger.endSession()
+        let note = URL(fileURLWithPath: try readRecord().notePath)
+        let upper = note.deletingLastPathComponent().appendingPathComponent(note.lastPathComponent.uppercased())
+        try FileManager.default.moveItem(at: note, to: upper)
+        guard FileManager.default.fileExists(atPath: note.path) else {
+            throw XCTSkip("case-sensitive volume")
+        }
+        XCTAssertEqual(TranscriptLogger.noteState(note), .present)
+        let result = await TranscriptLogger.recoverInterruptedRecordings(startedBefore: Date().addingTimeInterval(1), journalDirectory: journal)
+        XCTAssertEqual(result.recovered.count, 1)
+        XCTAssertTrue(try String(contentsOf: try XCTUnwrap(result.recovered.first), encoding: .utf8).contains("still here"))
+    }
+
+    /// Confirmed missing only when the folder can be read.
+    func testMissingNoteInReadableFolderIsMissing() {
+        XCTAssertEqual(TranscriptLogger.noteState(directory.appendingPathComponent("nope.md")), .missing)
+        XCTAssertEqual(TranscriptLogger.noteState(directory.appendingPathComponent("no-folder/nope.md")), .inaccessible)
     }
 
     /// Audio is kept for a record that can't be decoded, by its name.
