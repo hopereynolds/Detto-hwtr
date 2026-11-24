@@ -140,8 +140,11 @@ final class MicCapture: @unchecked Sendable {
                         let opened = try DirectDeviceCapture.start(
                             deviceID: id,
                             onBuffer: { sink.deliver($0) },
-                            onStopped: { [weak self] reason in
-                                self?.directCaptureStopped(reason, generation: generation, errorHolder: errorHolder)
+                            onStopped: { [weak self] source, reason in
+                                // Retire this source first, so no queued buffer
+                                // can make it look live again.
+                                sink.invalidate()
+                                self?.directCaptureStopped(reason, source: source, generation: generation, errorHolder: errorHolder)
                             }
                         )
                         self.direct = opened
@@ -176,14 +179,21 @@ final class MicCapture: @unchecked Sendable {
         }
     }
 
-    /// macOS stopped the direct capture session (runtime error, device
-    /// gone). Mark the mic stalled at once; the engine's mic watchdog sees
-    /// it and reconnects. Called on any thread.
-    private func directCaptureStopped(_ reason: String, generation: Int, errorHolder: SyncString) {
-        guard isCurrent(generation) else { return }
-        engineLog("[MIC-DIRECT-STOPPED] \(reason)")
-        errorHolder.value = "Microphone stopped (\(reason))"
-        _lastBufferAt.withLock { $0 = 1 }  // long ago: stalled now
+    /// macOS ended a direct capture session (runtime error, device gone).
+    /// Its sink is already invalidated. If it's still the current source,
+    /// mark the mic stalled at once so the watchdog reconnects; a late
+    /// notification from a source that's been replaced (e.g. by the
+    /// fallback) changes nothing. Called on any thread.
+    private func directCaptureStopped(_ reason: String, source: DirectDeviceCapture, generation: Int, errorHolder: SyncString) {
+        queue.async { [weak self] in
+            guard let self, self.isCurrent(generation), self.direct === source else {
+                engineLog("[MIC-DIRECT-STOPPED] \(reason) (old source, ignored)")
+                return
+            }
+            engineLog("[MIC-DIRECT-STOPPED] \(reason)")
+            errorHolder.value = "Microphone stopped (\(reason))"
+            self._lastBufferAt.withLock { $0 = 1 }  // long ago: stalled now
+        }
     }
 
     /// Opens the mic through AVAudioEngine. Only on `queue`.
@@ -573,23 +583,25 @@ private final class DirectDeviceCapture: NSObject, AVCaptureAudioDataOutputSampl
     private let output = AVCaptureAudioDataOutput()
     private let sampleQueue = DispatchQueue(label: "detto.mic-capture.samples", qos: .userInitiated)
     private let onBuffer: (AVAudioPCMBuffer) -> Void
-    private let onStopped: (String) -> Void
+    private let onStopped: (DirectDeviceCapture, String) -> Void
     private var observers: [NSObjectProtocol] = []
     /// Set by stop(), so our own stop isn't reported as a failure.
     private let stopping = AtomicBool()
 
-    private init(onBuffer: @escaping (AVAudioPCMBuffer) -> Void, onStopped: @escaping (String) -> Void) {
+    private init(onBuffer: @escaping (AVAudioPCMBuffer) -> Void, onStopped: @escaping (DirectDeviceCapture, String) -> Void) {
         self.onBuffer = onBuffer
         self.onStopped = onStopped
     }
 
     /// Blocks while the device opens; call off the main thread.
-    /// `onStopped` is called if macOS stops the session (runtime error,
-    /// device gone, interruption), not for stop().
+    /// `onStopped` is called once if macOS ends the session (runtime error,
+    /// stopped running), not for stop(). An interruption can end and resume
+    /// the same session, so it's only logged; if audio doesn't resume, the
+    /// engine's watchdog sees the stall.
     static func start(
         deviceID: AudioDeviceID,
         onBuffer: @escaping (AVAudioPCMBuffer) -> Void,
-        onStopped: @escaping (String) -> Void
+        onStopped: @escaping (DirectDeviceCapture, String) -> Void
     ) throws -> DirectDeviceCapture {
         // On macOS a capture device's uniqueID is the CoreAudio device UID.
         guard let uid = MicCapture.deviceUID(for: deviceID),
@@ -627,18 +639,29 @@ private final class DirectDeviceCapture: NSObject, AVCaptureAudioDataOutputSampl
             center.addObserver(forName: AVCaptureSession.didStopRunningNotification, object: session, queue: nil) { [weak capture] _ in
                 capture?.reportStop("capture session stopped")
             },
-            center.addObserver(forName: AVCaptureSession.wasInterruptedNotification, object: session, queue: nil) { [weak capture] _ in
-                capture?.reportStop("capture session interrupted")
+            center.addObserver(forName: AVCaptureSession.wasInterruptedNotification, object: session, queue: nil) { _ in
+                engineLog("[MIC-DIRECT] capture session interrupted")
+            },
+            center.addObserver(forName: AVCaptureSession.interruptionEndedNotification, object: session, queue: nil) { _ in
+                engineLog("[MIC-DIRECT] capture session interruption ended")
             },
         ]
         session.startRunning()
         return capture
     }
 
+    /// Runtime error and stopped-running can both fire; report once.
+    private let reported = OSAllocatedUnfairLock<Bool>(initialState: false)
+
     private func reportStop(_ reason: String) {
         guard !stopping.value else { return }
         engineLog("[MIC-DIRECT-ERR] \(reason)")
-        onStopped(reason)
+        let first = reported.withLock { done -> Bool in
+            defer { done = true }
+            return !done
+        }
+        guard first else { return }
+        onStopped(self, reason)
     }
 
     func stop() {

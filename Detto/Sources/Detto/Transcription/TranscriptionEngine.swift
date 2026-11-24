@@ -120,9 +120,15 @@ final class TranscriptionEngine {
     private var micKeepAliveTask: Task<Void, Never>?
     private var micWatchdogTask: Task<Void, Never>?
 
-    private static let micLostMessage = "Microphone stopped sending audio. Reconnecting..."
-    private static let micGaveUpMessage = "Microphone stopped and couldn't be reconnected. Stop and start again, or check the input in System Settings."
-    private static let micDisconnectedMessage = "Microphone disconnected. System audio continues."
+    /// What the mic is doing, for the toolbar. Kept apart from lastError.
+    enum MicStatus { case starting, live, reconnecting, lost }
+    private(set) var micStatus: MicStatus = .starting
+    private static let micLostMessage = "Your microphone stopped and couldn't be reconnected, so your side isn't being recorded. Stop and start again, or check the input in System Settings."
+    /// When the current mic open began (Start, device change or retry).
+    private var micAttemptStartedAt: Date?
+    /// How long an open may take before its first buffer: direct path
+    /// (2 s) plus the engine fallback (about 6-7 s with a headset).
+    private static let micFirstBufferDeadline: TimeInterval = 12
     private var deviceRestartTask: Task<Void, Never>?
 
     // Diarization state — updated from diarization update stream, read during attribution
@@ -290,6 +296,8 @@ final class TranscriptionEngine {
         let micDeviceParam = resolved.param
         currentMicDeviceID = resolved.tracked
         engineLog("[ENGINE-3] starting mic capture, deviceParam=\(String(describing: micDeviceParam)) tracked=\(currentMicDeviceID)")
+        micStatus = .starting
+        micAttemptStartedAt = Date()
         let micStream = micCapture.bufferStream(deviceID: micDeviceParam)
         if let captureError = micCapture.captureError {
             lastError = captureError
@@ -586,6 +594,8 @@ final class TranscriptionEngine {
         micCapture.stop()
 
         currentMicDeviceID = resolvedMicID
+        micAttemptStartedAt = Date()
+        if micStatus == .live { micStatus = .reconnecting }
 
         let micDeviceParam = resolved.param
         let micStream = micCapture.bufferStream(deviceID: micDeviceParam)
@@ -643,14 +653,8 @@ final class TranscriptionEngine {
             }
         }
 
+        // The mic watchdog follows this attempt (micAttemptStartedAt).
         engineLog("[ENGINE-MIC-SWAP] mic restarted on device \(resolvedMicID)")
-
-        Task {
-            try? await Task.sleep(for: .seconds(3))
-            guard self.isRunning, !self.micCapture.tapIsActive else { return }
-            engineLog("[ENGINE-MIC-WATCHDOG] No mic activity 3s after restart")
-            self.lastError = Self.micDisconnectedMessage
-        }
     }
 
     // MARK: - Speaker Attribution
@@ -830,11 +834,9 @@ final class TranscriptionEngine {
             }
             guard let self, self.isRunning else { return }
             if !self.micIsLive {
+                // The toolbar shows the mic's state; the watchdog retries.
                 let detail = self.micCapture.captureError.map { " (\($0))" } ?? ""
                 engineLog("[ENGINE-LIVE-WARN] no mic audio 10s after start\(detail)")
-                self.lastError = self.systemAudioStopped
-                    ? "Computer audio stopped, and the microphone isn't sending audio\(detail)."
-                    : "Microphone isn't sending audio\(detail)."
             } else if !self.systemIsLive, self.lastError == nil {
                 engineLog("[ENGINE-LIVE-WARN] no system audio 10s after start")
                 self.lastError = "Computer audio isn't coming through yet."
@@ -842,52 +844,56 @@ final class TranscriptionEngine {
         }
     }
 
-    /// Watches the mic for the whole session. If it stops delivering audio
-    /// after it had started (Bluetooth handoff, macOS ending the capture),
-    /// LIVE drops right away (micIsLive checks freshness), and this
-    /// reconnects it: up to 3 tries, 5 s apart. A stall during startup is
-    /// left to watchFirstAudio.
+    /// Watches the mic for the whole session and drives `micStatus`.
+    ///
+    /// Every mic (re)open is one attempt, whoever started it (Start, a
+    /// device change, a retry); `restartMic` stamps `micAttemptStartedAt`.
+    /// An attempt that hasn't delivered gets `micFirstBufferDeadline` to do
+    /// so (the fallback path alone can take ~7 s with a headset); a mic that
+    /// had delivered and then went quiet for 3 s is stalled. Either way it
+    /// retries, up to 3 times, then shows MIC LOST. Audio coming back resets
+    /// everything. Doesn't touch `lastError`, so other instructions (e.g.
+    /// screen recording) stay visible.
     private func startMicWatchdog() {
         micWatchdogTask?.cancel()
         micWatchdogTask = Task { [weak self] in
-            var lastRestart: Date?
-            var attempts = 0
-            var gaveUp = false
+            var retries = 0
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(1))
                 guard let self, self.isRunning, !Task.isCancelled else { return }
                 let mic = self.micCapture
                 if mic.tapIsActive {
-                    if attempts > 0 || gaveUp {
-                        engineLog("[ENGINE-MIC-WATCH] mic audio is back")
-                        if [Self.micLostMessage, Self.micGaveUpMessage, Self.micDisconnectedMessage].contains(self.lastError) {
-                            self.lastError = nil
+                    if self.micStatus != .live {
+                        if retries > 0 || self.micStatus == .lost {
+                            engineLog("[ENGINE-MIC-WATCH] mic audio is back")
                         }
-                        attempts = 0
-                        gaveUp = false
+                        self.micStatus = .live
+                        retries = 0
+                        if self.lastError == Self.micLostMessage { self.lastError = nil }
                     }
                     continue
                 }
-                let sinceRestart = lastRestart.map { Date().timeIntervalSince($0) }
-                if let sinceRestart, sinceRestart < 5 { continue }
-                // Stalled after delivering, or a reconnect that never delivered.
-                let stalled = mic.hasDelivered
-                    ? (mic.secondsSinceLastBuffer ?? 0) >= 3
-                    : sinceRestart != nil
-                guard stalled else { continue }
-                guard attempts < 3 else {
-                    if !gaveUp {
-                        engineLog("[ENGINE-MIC-WATCH] giving up after \(attempts) reconnects")
-                        self.lastError = Self.micGaveUpMessage
-                        gaveUp = true
-                    }
+                let attemptAge = self.micAttemptStartedAt.map { Date().timeIntervalSince($0) } ?? 0
+                let failed: Bool
+                if mic.hasDelivered {
+                    failed = (mic.secondsSinceLastBuffer ?? 0) >= 3
+                } else {
+                    // A device change or retry is opening the mic.
+                    if self.micStatus == .live { self.micStatus = .reconnecting }
+                    failed = attemptAge >= Self.micFirstBufferDeadline
+                }
+                guard failed, self.micStatus != .lost else { continue }
+                guard retries < 3 else {
+                    engineLog("[ENGINE-MIC-WATCH] giving up after \(retries) reconnects")
+                    self.micStatus = .lost
+                    // Explain it, unless another instruction is showing.
+                    if self.lastError == nil { self.lastError = Self.micLostMessage }
                     continue
                 }
-                attempts += 1
+                retries += 1
                 let age = mic.secondsSinceLastBuffer.map { String(format: "%.1fs", $0) } ?? "never"
-                engineLog("[ENGINE-MIC-WATCH] no mic audio (last buffer \(age) ago\(mic.captureError.map { ", \($0)" } ?? "")); reconnecting, attempt \(attempts)")
-                self.lastError = Self.micLostMessage
-                lastRestart = Date()
+                engineLog("[ENGINE-MIC-WATCH] no mic audio (last buffer \(age) ago, attempt \(Int(attemptAge))s old\(mic.captureError.map { ", \($0)" } ?? "")); reconnecting, retry \(retries)")
+                self.micStatus = .reconnecting
                 self.restartMic(inputDeviceID: self.userSelectedDeviceID, force: true)
             }
         }
@@ -914,6 +920,8 @@ final class TranscriptionEngine {
         micKeepAliveTask?.cancel()
         micWatchdogTask?.cancel()
         micWatchdogTask = nil
+        micAttemptStartedAt = nil
+        micStatus = .starting
         micReaderTask = nil
         micTranscribeTask = nil
         sysLoopTask = nil

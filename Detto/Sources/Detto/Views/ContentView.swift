@@ -499,6 +499,20 @@ struct ContentView: View {
             }
             .accessibilityElement(children: .combine)
             .accessibilityLabel("Call audio lost. The other side isn't being recorded.")
+        } else if !micIsLive, transcriptionEngine?.micStatus == .lost {
+            // Retries are exhausted: no spinner, nothing is in progress.
+            HStack(spacing: 6) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(Color.dRed)
+                Text("MIC LOST")
+                    .font(.dMono(size: 9, weight: .bold))
+                    .tracking(1)
+                    .foregroundStyle(Color.dRed)
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("Microphone lost. Your side isn't being recorded. Stop and start again, or check the input in System Settings.")
+            .help("Your side isn't being recorded. Stop and start again, or check the input in System Settings.")
         } else if micIsLive && systemIsLive {
             HStack(spacing: 6) {
                 Text("LIVE")
@@ -524,11 +538,14 @@ struct ContentView: View {
     }
 
     private var waitingLabel: String {
-        switch (micIsLive, systemIsLive) {
-        case (false, false): return "STARTING"
-        case (false, true): return "WAITING FOR MIC"
-        default: return "WAITING FOR CALL AUDIO"
+        if !micIsLive {
+            switch transcriptionEngine?.micStatus {
+            case .reconnecting: return "RECONNECTING MIC"
+            case .lost: return "MIC LOST"
+            default: return systemIsLive ? "WAITING FOR MIC" : "STARTING"
+            }
         }
+        return "WAITING FOR CALL AUDIO"
     }
 
     // MARK: - Empty State
