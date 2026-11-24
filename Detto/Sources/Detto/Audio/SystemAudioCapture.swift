@@ -4,15 +4,23 @@ import CoreMedia
 import os
 
 final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate, SCStreamOutput {
-    private let _stream = OSAllocatedUnfairLock<SCStream?>(uncheckedState: nil)
+    /// The current stream and whether it has delivered audio, under one
+    /// lock: a stream that stops is invalidated in the same step that
+    /// clears readiness, so a sample callback already in flight can't mark
+    /// it live again.
+    private struct StreamState {
+        var stream: SCStream?
+        var hasAudio = false
+        var sampleCount = 0
+    }
+    private let _state = OSAllocatedUnfairLock<StreamState>(uncheckedState: StreamState())
     private let _sysContinuation = OSAllocatedUnfairLock<AsyncStream<AVAudioPCMBuffer>.Continuation?>(uncheckedState: nil)
     private let _micContinuation = OSAllocatedUnfairLock<AsyncStream<AVAudioPCMBuffer>.Continuation?>(uncheckedState: nil)
     private let _audioLevel = AudioLevel()
-    private let _hasAudio = AtomicBool()
 
     var audioLevel: Float { _audioLevel.value }
     /// True once the current stream has delivered audio, until it stops.
-    var hasAudio: Bool { _hasAudio.value }
+    var hasAudio: Bool { _state.withLock { $0.hasAudio } }
 
     /// Called (on a capture thread) when macOS stops the current stream
     /// with an error, e.g. -3815. Not called for stop().
@@ -21,9 +29,6 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
         _onStreamStopped.withLock { $0 = handler }
     }
 
-    private func isCurrent(_ stream: SCStream) -> Bool {
-        _stream.withLock { $0 === stream }
-    }
 
     struct CaptureStreams {
         let systemAudio: AsyncStream<AVAudioPCMBuffer>
@@ -31,7 +36,7 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
 
     /// Start capturing system audio. Pass a bundle ID to filter to a specific app.
     func bufferStream(appBundleID: String? = nil) async throws -> CaptureStreams {
-        _hasAudio.value = false
+        _state.withLock { $0 = StreamState() }
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
 
         guard let display = content.displays.first else {
@@ -69,27 +74,27 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
             self._sysContinuation.withLock { $0 = cont }
         }
 
-        _stream.withLock { $0 = scStream }
+        _state.withLock { $0 = StreamState(stream: scStream) }
         try await scStream.startCapture()
 
         return CaptureStreams(systemAudio: sysStream)
     }
 
     func stop() async {
-        try? await _stream.withLock { $0 }?.stopCapture()
-        _stream.withLock { $0 = nil }
+        let stream = _state.withLock { state -> SCStream? in
+            let stream = state.stream
+            state = StreamState()
+            return stream
+        }
+        try? await stream?.stopCapture()
         _sysContinuation.withLock { $0?.finish(); $0 = nil }
         _audioLevel.value = 0
-        _hasAudio.value = false
-        _sampleCount.withLock { $0 = 0 }
     }
 
     // MARK: - SCStreamOutput
 
-    private let _sampleCount = OSAllocatedUnfairLock<Int>(uncheckedState: 0)
-
     nonisolated func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
-        guard type == .audio, isCurrent(stream) else { return }
+        guard type == .audio else { return }
         guard let formatDesc = sampleBuffer.formatDescription,
               var asbd = formatDesc.audioStreamBasicDescription else { return }
 
@@ -109,13 +114,21 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
         )
         guard status == noErr else { return }
 
+        // Count the sample and mark the stream live, only if it is still
+        // the current stream.
+        let counted = _state.withLock { state -> Int? in
+            guard state.stream === stream else { return nil }
+            state.sampleCount += 1
+            state.hasAudio = true
+            return state.sampleCount
+        }
+        guard let count = counted else { return }
+
         // Update audio level for visualizer
         let rms = Self.normalizedRMS(from: pcmBuffer)
         _audioLevel.value = min(rms * 25, 1.0)
 
         // Diagnostic: log raw system audio levels periodically
-        let count = _sampleCount.withLock { val -> Int in val += 1; return val }
-        if count == 1 { _hasAudio.value = true }
         if count <= 5 || count % 200 == 0 {
             engineLog("[SYS-RAW] #\(count) frames=\(frameCount) sr=\(asbd.mSampleRate) ch=\(asbd.mChannelsPerFrame) rms=\(rms)")
         }
@@ -126,12 +139,16 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
     // MARK: - SCStreamDelegate
 
     nonisolated func stream(_ stream: SCStream, didStopWithError error: any Error) {
-        guard isCurrent(stream) else {
+        let wasCurrent = _state.withLock { state -> Bool in
+            guard state.stream === stream else { return false }
+            state = StreamState()
+            return true
+        }
+        guard wasCurrent else {
             engineLog("[SYS-STOP] an old stream stopped with error (ignored): \(error)")
             return
         }
         engineLog("[SYS-STOP] stream stopped with error: \(error)")
-        _hasAudio.value = false
         _audioLevel.value = 0
         _sysContinuation.withLock { $0?.finish(); $0 = nil }
         _onStreamStopped.withLock { $0 }?(error)

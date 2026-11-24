@@ -31,6 +31,7 @@ final class MicCapture: @unchecked Sendable {
         let tapActive = _tapActive
         tapActive.value = false
         let generation = _generation.withLock { value -> Int in value += 1; return value }
+        let generationLock = _generation
 
         return AsyncStream { continuation in
             errorHolder.value = nil
@@ -112,7 +113,9 @@ final class MicCapture: @unchecked Sendable {
 
                 var tapCallCount = 0
                 inputNode.installTap(onBus: 0, bufferSize: 4096, format: tapFormat) { buffer, _ in
-                    guard self.isCurrent(generation) else { return }
+                    // Captures the lock, not self: the engine retains this
+                    // block, and self owns the engine.
+                    guard generationLock.withLock({ $0 == generation }) else { return }
                     tapCallCount += 1
                     if tapCallCount == 1 { tapActive.value = true }
                     let rms = Self.normalizedRMS(from: buffer)

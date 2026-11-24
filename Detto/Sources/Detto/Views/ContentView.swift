@@ -319,6 +319,15 @@ struct ContentView: View {
                     saveBanner(url: url)
                 }
 
+                // A failed Start (e.g. mic permission) lands back here; keep
+                // its instructions visible.
+                if let error = transcriptionEngine?.lastError {
+                    Text(error).font(.dMono(size: 10, weight: .medium)).foregroundStyle(Color.dRed)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.horizontal, 14).padding(.vertical, 6)
+                }
+
                 BriefingPanelView(
                     selectedClient: activeClient ?? clientRegistry.selectedClient,
                     isRecording: false,
@@ -477,7 +486,20 @@ struct ContentView: View {
     /// session records. Until then, says what it's waiting for.
     @ViewBuilder
     private var liveIndicator: some View {
-        if micIsLive && systemIsLive {
+        if transcriptionEngine?.systemAudioStopped == true {
+            // Lost beats LIVE and STARTING: the other side isn't recorded.
+            HStack(spacing: 6) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(Color.dRed)
+                Text("CALL AUDIO LOST")
+                    .font(.dMono(size: 9, weight: .bold))
+                    .tracking(1)
+                    .foregroundStyle(Color.dRed)
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("Call audio lost. The other side isn't being recorded.")
+        } else if micIsLive && systemIsLive {
             HStack(spacing: 6) {
                 Text("LIVE")
                     .font(.dMono(size: 9, weight: .bold))
@@ -505,8 +527,7 @@ struct ContentView: View {
         switch (micIsLive, systemIsLive) {
         case (false, false): return "STARTING"
         case (false, true): return "WAITING FOR MIC"
-        default:
-            return transcriptionEngine?.systemAudioStopped == true ? "CALL AUDIO LOST" : "WAITING FOR CALL AUDIO"
+        default: return "WAITING FOR CALL AUDIO"
         }
     }
 

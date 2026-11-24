@@ -551,7 +551,9 @@ final class TranscriptionEngine {
         guard isRunning, sessionIsCallCapture else { return }
         engineLog("[ENGINE-SYS-LOST] call audio stream stopped: \(error.localizedDescription)")
         systemAudioStopped = true
-        lastError = "Computer audio stopped, so the other side isn't being recorded. Your mic is still recording."
+        lastError = micIsLive
+            ? "Computer audio stopped, so the other side isn't being recorded. Your mic is still recording."
+            : "Computer audio stopped, so the other side isn't being recorded."
     }
 
     /// Restart only the mic capture with a new device, keeping system audio and models intact.
@@ -823,7 +825,9 @@ final class TranscriptionEngine {
             if !self.micIsLive {
                 let detail = self.micCapture.captureError.map { " (\($0))" } ?? ""
                 engineLog("[ENGINE-LIVE-WARN] no mic audio 10s after start\(detail)")
-                self.lastError = "Microphone isn't sending audio\(detail)."
+                self.lastError = self.systemAudioStopped
+                    ? "Computer audio stopped, and the microphone isn't sending audio\(detail)."
+                    : "Microphone isn't sending audio\(detail)."
             } else if !self.systemIsLive, self.lastError == nil {
                 engineLog("[ENGINE-LIVE-WARN] no system audio 10s after start")
                 self.lastError = "Computer audio isn't coming through yet."
