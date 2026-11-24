@@ -99,6 +99,9 @@ final class TranscriptionEngine {
     /// The call-audio pipeline is consuming the capture stream, so a
     /// reconnect has somewhere to deliver.
     private var systemConsumerAttached = false
+    /// A loss notice for this recording that arrived before the pipeline
+    /// attached; handled as soon as it does.
+    private var pendingSystemStop: (error: any Error, generation: Int)?
     /// Waits before each reconnect attempt: about a minute in all.
     private static let systemRestartDelays: [Duration] = [.seconds(1), .seconds(2), .seconds(4), .seconds(8), .seconds(15)]
     /// How long a new stream gets to deliver before the next attempt.
@@ -334,6 +337,7 @@ final class TranscriptionEngine {
 
         // 3. Start system audio capture (skipped for mic-only mode)
         systemAudioStopped = false
+        pendingSystemStop = nil
         systemCapture.setOnStreamStopped { [weak self] generation, error in
             Task { @MainActor in self?.systemStreamStopped(error, generation: generation) }
         }
@@ -350,6 +354,10 @@ final class TranscriptionEngine {
             do {
                 sysStreams = try await systemCapture.bufferStream(appBundleID: appBundleID)
                 systemConsumerAttached = true
+                if let pending = pendingSystemStop {
+                    pendingSystemStop = nil
+                    systemStreamStopped(pending.error, generation: pending.generation)
+                }
                 engineLog("[ENGINE-5] system audio capture started OK")
             } catch {
                 let msg = "Failed to start system audio: \(error.localizedDescription)"
@@ -593,10 +601,17 @@ final class TranscriptionEngine {
     /// macOS ended the call-audio stream. Drop LIVE, say so and try to
     /// bring it back; the mic keeps recording.
     private func systemStreamStopped(_ error: any Error, generation: Int) {
-        guard isRunning, sessionIsCallCapture, systemConsumerAttached else { return }
+        guard isRunning, sessionIsCallCapture else { return }
         // A late notice from a recording that has since been stopped.
         guard generation == systemCapture.generation else {
             engineLog("[ENGINE-SYS-LOST] ignored a stop notice from an earlier recording")
+            return
+        }
+        // The first stream died before start() attached the pipeline:
+        // keep the notice and handle it once it attaches.
+        guard systemConsumerAttached else {
+            engineLog("[ENGINE-SYS-LOST] stop notice before the pipeline attached; handling it once it does")
+            pendingSystemStop = (error, generation)
             return
         }
         engineLog("[ENGINE-SYS-LOST] call audio stream stopped: \(error.localizedDescription)")
@@ -1000,6 +1015,7 @@ final class TranscriptionEngine {
         systemRestartTask = nil
         systemAudioReconnecting = false
         systemConsumerAttached = false
+        pendingSystemStop = nil
         await systemCapture.stop()
         // Wait for the mic to actually stop (and cancel a setup still
         // opening the device), so nothing turns it on after Stop finishes.
