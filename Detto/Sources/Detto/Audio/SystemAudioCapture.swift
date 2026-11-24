@@ -29,8 +29,12 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
         var lastSampleAt: Date?
         /// The current stream is a replacement that hasn't delivered yet.
         var fillGapOnFirstSample = false
-        /// Opens that haven't finished; stop() waits for them.
-        var opening = 0
+        /// The current stream finished starting. Only a started stream's
+        /// death is reported; one that dies while starting fails its open.
+        var streamStarted = false
+        /// Opens and closes that haven't finished; stop() waits for them,
+        /// so nothing is still capturing (or shutting down) after it.
+        var busy = 0
     }
     private let _state = OSAllocatedUnfairLock<State>(uncheckedState: State())
     private let _micContinuation = OSAllocatedUnfairLock<AsyncStream<AVAudioPCMBuffer>.Continuation?>(uncheckedState: nil)
@@ -63,12 +67,14 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
         case noDisplay
         case appNotFound(String)
         case stopped
+        case diedWhileStarting
 
         var errorDescription: String? {
             switch self {
             case .noDisplay: return "No display to capture from."
             case .appNotFound(let id): return "\(id) isn't available to capture."
             case .stopped: return "Recording stopped."
+            case .diedWhileStarting: return "macOS stopped the capture while it was starting."
             }
         }
     }
@@ -82,7 +88,7 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
         let (generation, previous) = _state.withLock { state -> (Int, AsyncStream<AVAudioPCMBuffer>.Continuation?) in
             let previous = state.continuation
             let generation = state.generation + 1
-            state = State(generation: generation, continuation: continuation, opening: state.opening)
+            state = State(generation: generation, continuation: continuation, busy: state.busy)
             return (generation, previous)
         }
         previous?.finish()
@@ -98,11 +104,16 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
             guard state.continuation != nil, state.scope != nil else { return (nil, nil) }
             let previous = state.stream
             state.stream = nil
+            state.streamStarted = false
             state.hasAudio = false
             state.sampleCount = 0
+            if previous != nil { state.busy += 1 }
             return (state.generation, previous)
         }
-        try? await previous?.stopCapture()
+        if let previous {
+            try? await previous.stopCapture()
+            _state.withLock { $0.busy -= 1 }
+        }
         guard let generation else { return false }
         do {
             try await open(generation: generation, requestedAppBundleID: nil)
@@ -117,14 +128,16 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
     /// giving up. Returns true if it's live after all.
     func closeReplacementIfSilent() async -> Bool {
         let silent = _state.withLock { state -> SCStream? in
-            guard !state.hasAudio else { return nil }
-            let stream = state.stream
+            guard !state.hasAudio, let stream = state.stream else { return nil }
             state.stream = nil
+            state.streamStarted = false
+            state.busy += 1
             return stream
         }
         if let silent {
             engineLog("[SYS-RESTART] closing a replacement that never delivered")
             try? await silent.stopCapture()
+            _state.withLock { $0.busy -= 1 }
             return false
         }
         return hasAudio
@@ -134,8 +147,8 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
     /// (per-app when the app is there, otherwise all system audio, as
     /// before); later opens keep it and fail if the app is missing.
     private func open(generation: Int, requestedAppBundleID: String?) async throws {
-        _state.withLock { $0.opening += 1 }
-        defer { _state.withLock { $0.opening -= 1 } }
+        _state.withLock { $0.busy += 1 }
+        defer { _state.withLock { $0.busy -= 1 } }
 
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
         guard let display = content.displays.first else {
@@ -192,6 +205,7 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
             guard state.generation == generation, state.continuation != nil else { return false }
             state.scope = scope
             state.stream = scStream
+            state.streamStarted = false
             state.hasAudio = false
             state.sampleCount = 0
             state.fillGapOnFirstSample = isReplacement
@@ -207,26 +221,37 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
             }
             throw error
         }
-        // Stop (or a newer attempt) may have run while it was starting.
-        let stillCurrent = _state.withLock { $0.stream === scStream }
-        if !stillCurrent {
+        // Stop may have run while it was starting, or macOS may have
+        // stopped it already. Mark it started in the same step.
+        let outcome = _state.withLock { state -> CaptureError? in
+            guard state.generation == generation, state.continuation != nil else { return .stopped }
+            guard state.stream === scStream else { return .diedWhileStarting }
+            state.streamStarted = true
+            return nil
+        }
+        if let outcome {
             try? await scStream.stopCapture()
-            throw CaptureError.stopped
+            if case .diedWhileStarting = outcome {
+                engineLog("[SYS-STOP] stream stopped while starting; counts as a failed attempt")
+            }
+            throw outcome
         }
     }
 
     func stop() async {
         let (stream, continuation) = _state.withLock { state -> (SCStream?, AsyncStream<AVAudioPCMBuffer>.Continuation?) in
             let taken = (state.stream, state.continuation)
-            state = State(generation: state.generation + 1, opening: state.opening)
+            state = State(generation: state.generation + 1, busy: state.busy)
             return taken
         }
         continuation?.finish()
         _audioLevel.value = 0
         try? await stream?.stopCapture()
-        // An open in flight stops its own stream once it sees Stop; wait
-        // for it so nothing is capturing after stop() returns.
-        for _ in 0..<250 where _state.withLock({ $0.opening > 0 }) {
+        // An open in flight stops its own stream once it sees Stop, and a
+        // close in flight finishes on its own; wait for both (up to 5 s)
+        // so nothing is capturing or shutting down after stop() returns.
+        let deadline = ContinuousClock.now + .seconds(5)
+        while _state.withLock({ $0.busy > 0 }), ContinuousClock.now < deadline {
             try? await Task.sleep(for: .milliseconds(20))
         }
     }
@@ -316,16 +341,27 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
     // MARK: - SCStreamDelegate
 
     nonisolated func stream(_ stream: SCStream, didStopWithError error: any Error) {
-        let generation = _state.withLock { state -> Int? in
-            guard state.stream === stream else { return nil }
+        enum Kind { case old, starting, running(Int) }
+        let kind = _state.withLock { state -> Kind in
+            guard state.stream === stream else { return .old }
+            let started = state.streamStarted
             state.stream = nil
+            state.streamStarted = false
             state.hasAudio = false
             state.sampleCount = 0
-            return state.generation
+            return started ? .running(state.generation) : .starting
         }
-        guard let generation else {
+        let generation: Int
+        switch kind {
+        case .old:
             engineLog("[SYS-STOP] an old stream stopped with error (ignored): \(error)")
             return
+        case .starting:
+            // open() sees it's gone and fails the attempt.
+            engineLog("[SYS-STOP] stream stopped while starting: \(error)")
+            return
+        case .running(let current):
+            generation = current
         }
         engineLog("[SYS-STOP] stream stopped with error: \(error)")
         _audioLevel.value = 0
