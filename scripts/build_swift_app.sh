@@ -215,6 +215,18 @@ if [[ -w /Applications/ ]]; then
   STAGED="/Applications/.$APP_NAME.app.new"
   PREVIOUS="/Applications/.$APP_NAME.app.old"
 
+  # Recover from an interrupted earlier install before touching anything.
+  # The swap below is: DEST -> PREVIOUS, STAGED -> DEST, delete PREVIOUS.
+  # A backup with no installed app means it stopped mid-swap: put it back.
+  # A backup next to an installed app means the swap finished: the backup
+  # is the older build and is safe to delete.
+  if [[ -d "$PREVIOUS" && ! -e "$DEST" ]]; then
+    echo "Restoring the previous app left by an interrupted install"
+    mv "$PREVIOUS" "$DEST"
+  elif [[ -d "$PREVIOUS" ]]; then
+    rm -rf "$PREVIOUS"
+  fi
+
   if [[ -d "$DEST" ]]; then
     INSTALLED_ID=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$DEST/Contents/Info.plist" 2>/dev/null || true)
     if [[ "$INSTALLED_ID" != "$BUNDLE_ID" ]]; then
@@ -223,7 +235,7 @@ if [[ -w /Applications/ ]]; then
     fi
   fi
 
-  rm -rf "$STAGED" "$PREVIOUS"
+  rm -rf "$STAGED"
   ditto "$APP_DIR" "$STAGED"
   if [[ -n "${CODESIGN_IDENTITY:-}" ]] && ! codesign --verify --deep --strict "$STAGED"; then
     rm -rf "$STAGED"
