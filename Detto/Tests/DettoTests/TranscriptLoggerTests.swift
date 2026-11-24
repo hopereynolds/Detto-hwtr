@@ -375,6 +375,39 @@ final class TranscriptLoggerTests: XCTestCase {
         XCTAssertTrue(try String(contentsOf: try XCTUnwrap(result.recovered.first), encoding: .utf8).contains("still here"))
     }
 
+    /// A crash after noting a pending name that differs only in case: on a
+    /// case-insensitive disk both names open the one note, so it isn't a
+    /// published copy. Recovery finishes it in place instead of deleting it.
+    func testCaseOnlyPendingNameKeepsTheOnlyNote() async throws {
+        let logger = makeLogger()
+        try await logger.startSession(sourceApp: "Call", vaultPath: directory.path, context: "Design sync")
+        await logger.append(speaker: "You", text: "only copy", timestamp: Date())
+        let audio = try await makeAudioFile(for: logger)
+        await logger.endSession()
+        var record = try readRecord()
+        let fmt = DateFormatter()
+        fmt.dateFormat = "yyyy-MM-dd HH-mm-ss"
+        let prefix = fmt.string(from: record.startedAt)
+        let original = directory.appendingPathComponent("\(prefix) DESIGN SYNC.md")
+        let pending = directory.appendingPathComponent("\(prefix) Design sync.md")
+        try FileManager.default.moveItem(at: URL(fileURLWithPath: record.notePath), to: original)
+        guard FileManager.default.fileExists(atPath: pending.path) else {
+            throw XCTSkip("case-sensitive volume")
+        }
+        record.notePath = original.path
+        record.pendingPath = pending.path
+        try writeRecord(record)
+
+        let result = await TranscriptLogger.recoverInterruptedRecordings(startedBefore: Date().addingTimeInterval(1), journalDirectory: journal)
+        XCTAssertEqual(result.recovered.count, 1)
+        XCTAssertEqual(try notes(), [original.lastPathComponent])
+        let content = try String(contentsOf: original, encoding: .utf8)
+        XCTAssertTrue(content.contains("only copy"))
+        XCTAssertTrue(content.contains("[!warning] Recovered"))
+        XCTAssertEqual(journalEntries(), [])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: audio.path))
+    }
+
     /// Confirmed missing only when the folder can be read.
     func testMissingNoteInReadableFolderIsMissing() {
         XCTAssertEqual(TranscriptLogger.noteState(directory.appendingPathComponent("nope.md")), .missing)

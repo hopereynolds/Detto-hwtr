@@ -116,12 +116,26 @@ actor TranscriptLogger {
     }
 
     /// The renamed note an interrupted save already published, if the
-    /// file at `pendingPath` really is this recording's.
+    /// file at `pendingPath` really is this recording's and is a separate
+    /// file from the original. (On a case-insensitive disk a name that
+    /// differs only in capitalization opens the original itself; that's
+    /// not a copy, and treating it as one would delete the only note.)
     private static func publishedNote(of journal: Journal) -> URL? {
-        guard let pending = journal.record.pendingPath,
+        guard let pending = journal.record.pendingPath else { return nil }
+        let pendingURL = URL(fileURLWithPath: pending)
+        guard !isSameFile(pendingURL, URL(fileURLWithPath: journal.record.notePath)),
               let content = try? String(contentsOfFile: pending, encoding: .utf8),
               isOwnNote(content, of: journal) else { return nil }
-        return URL(fileURLWithPath: pending)
+        return pendingURL
+    }
+
+    /// Whether two paths reach the same file on disk (same volume and file
+    /// number), e.g. names differing only in case on a case-insensitive disk.
+    static func isSameFile(_ a: URL, _ b: URL) -> Bool {
+        if a.path == b.path { return true }
+        var sa = stat(), sb = stat()
+        guard stat(a.path, &sa) == 0, stat(b.path, &sb) == 0 else { return false }
+        return sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino
     }
 
     /// Whether a note is this recording's: its frontmatter carries exactly
@@ -206,7 +220,7 @@ actor TranscriptLogger {
             // finish its cleanup instead of saving a second copy. The
             // original is removed only if it's still this recording's.
             if let published = publishedNote(of: journal) {
-                if published.path != note.path,
+                if !isSameFile(published, note),
                    let original = try? String(contentsOf: note, encoding: .utf8),
                    isOwnNote(original, of: journal) {
                     try? FileManager.default.removeItem(at: note)
@@ -728,7 +742,9 @@ tags:
 
             for newFilename in candidateNames("\(datePrefix) \(truncated)") {
                 let newPath = directory.appendingPathComponent(newFilename)
-                if newPath.path == filePath.path { break }  // already named this
+                // Already named this, or a name that only differs in case
+                // and opens this same file: keep the name, save in place.
+                if isSameFile(newPath, filePath) { break }
 
                 var renamed = content
                 if let range = renamed.range(of: #"source_file: ".*""#, options: .regularExpression) {
