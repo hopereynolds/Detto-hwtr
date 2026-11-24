@@ -4,6 +4,7 @@ struct BriefingPanelView: View {
     let selectedClient: ClientInfo?
     let isRecording: Bool
     var isSaving: Bool = false
+    var isStarting: Bool = false
     let silenceSeconds: Int
     @Binding var editableContext: String
     @Binding var genericAttendees: String
@@ -228,7 +229,7 @@ struct BriefingPanelView: View {
             }
             .buttonStyle(.plain)
         }
-        .disabled(isSaving)
+        .disabled(isSaving || isStarting)
         .opacity(isSaving ? 0.5 : 1)
         .padding(.horizontal, 12)
         .padding(.bottom, 10)

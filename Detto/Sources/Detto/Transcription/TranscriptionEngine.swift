@@ -208,7 +208,9 @@ final class TranscriptionEngine {
 
     func start(locale: Locale, inputDeviceID: AudioDeviceID = 0, appBundleID: String? = nil, micOnly: Bool = false, preferBuiltInMic: Bool = true, vocabularyCorrector: VocabularyCorrector? = nil) async {
         engineLog("[ENGINE-0] start() called, isRunning=\(isRunning)")
-        guard !isRunning else { return }
+        guard !isRunning, !isStarting else { return }
+        isStarting = true
+        defer { isStarting = false }
         lastError = nil
         preferBuiltInMicDuringCalls = preferBuiltInMic
         sessionIsCallCapture = !micOnly
@@ -216,8 +218,6 @@ final class TranscriptionEngine {
         guard await ensureMicrophonePermission() else { return }
 
         isRunning = true
-        isStarting = true
-        defer { isStarting = false }
         let startedAt = Date()
         self.corrector = vocabularyCorrector
         if let c = vocabularyCorrector {
@@ -306,6 +306,7 @@ final class TranscriptionEngine {
 
         // 4. Start mic transcription pipeline (VADProcessor — no timing needed)
         let store = transcriptStore
+        let storeSession = transcriptStore.session
         do {
             let micVadManager = try await modelManager.makeVadManager()
             let micVad = VADProcessor(vadManager: micVadManager)
@@ -350,7 +351,7 @@ final class TranscriptionEngine {
                     let confidence = result.confidence
                     Task { @MainActor in
                         store.volatileYouText = ""
-                        store.append(Utterance(text: text, speaker: .you, speakerName: "You", confidence: confidence))
+                        store.append(Utterance(text: text, speaker: .you, speakerName: "You", confidence: confidence), session: storeSession)
                     }
                 }
                 if hadFatalError {
@@ -466,7 +467,7 @@ final class TranscriptionEngine {
                                             speechSamples.removeAll(keepingCapacity: true)
                                             await Self.transcribeAndAttribute(
                                                 segment: segment, startTime: startT, endTime: endT,
-                                                asr: asr, store: store, engine: self,
+                                                asr: asr, store: store, storeSession: storeSession, engine: self,
                                                 diarAvailable: diarAvailable,
                                                 corrector: sysVocabCorrector
                                             )
@@ -488,7 +489,7 @@ final class TranscriptionEngine {
                                         speechStartOffset = totalSampleOffset
                                         await Self.transcribeAndAttribute(
                                             segment: segment, startTime: startT, endTime: endT,
-                                            asr: asr, store: store, engine: self,
+                                            asr: asr, store: store, storeSession: storeSession, engine: self,
                                             diarAvailable: diarAvailable,
                                             corrector: sysVocabCorrector
                                         )
@@ -512,7 +513,7 @@ final class TranscriptionEngine {
                         let endT = TimeInterval(totalSampleOffset) / 16000.0
                         await Self.transcribeAndAttribute(
                             segment: speechSamples, startTime: startT, endTime: endT,
-                            asr: asr, store: store, engine: self,
+                            asr: asr, store: store, storeSession: storeSession, engine: self,
                             diarAvailable: diarAvailable,
                             corrector: sysVocabCorrector
                         )
@@ -561,6 +562,7 @@ final class TranscriptionEngine {
             lastError = captureError
         }
         let store = transcriptStore
+        let storeSession = transcriptStore.session
         let asr = asrEngine
         let micResampler = AudioBufferResampler()
 
@@ -601,7 +603,7 @@ final class TranscriptionEngine {
                     let confidence = result.confidence
                     Task { @MainActor in
                         store.volatileYouText = ""
-                        store.append(Utterance(text: text, speaker: .you, speakerName: "You", confidence: confidence))
+                        store.append(Utterance(text: text, speaker: .you, speakerName: "You", confidence: confidence), session: storeSession)
                     }
                 }
                 if hadFatalError {
@@ -628,6 +630,7 @@ final class TranscriptionEngine {
         endTime: TimeInterval,
         asr: ParakeetStreamingEngine,
         store: TranscriptStore,
+        storeSession: Int,
         engine: TranscriptionEngine?,
         diarAvailable: Bool,
         corrector: VocabularyCorrector? = nil
@@ -683,7 +686,7 @@ final class TranscriptionEngine {
         let confidence = result.confidence
         Task { @MainActor in
             store.volatileThemText = ""
-            store.append(Utterance(text: text, speaker: .them, speakerName: speakerName, confidence: confidence))
+            store.append(Utterance(text: text, speaker: .them, speakerName: speakerName, confidence: confidence), session: storeSession)
         }
     }
 

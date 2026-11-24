@@ -34,6 +34,14 @@ struct ContentView: View {
     /// Starting a new session meanwhile would clear the transcript the old
     /// one is still saving, leaving an empty note (Nov 4).
     @State private var isSaving = false
+    /// True from Start until the engine has finished setting up. Set
+    /// synchronously, before the transcript is touched, so a second Start
+    /// (or a shortcut during recording) can't clear the live transcript.
+    @State private var isStarting = false
+    /// The in-flight start, so Stop can wait for it before saving.
+    @State private var startTask: Task<Void, Never>?
+    /// Stop arrived before the engine started; the start skips capture.
+    @State private var stopRequestedDuringStart = false
     /// Whether each side of the recording is actually delivering audio.
     /// Polled from the engine with the level meter.
     @State private var micIsLive = false
@@ -315,6 +323,7 @@ struct ContentView: View {
                     selectedClient: activeClient ?? clientRegistry.selectedClient,
                     isRecording: false,
                     isSaving: isSaving,
+                    isStarting: isStarting,
                     silenceSeconds: silenceSeconds,
                     editableContext: $editableContext,
                     genericAttendees: $genericAttendees,
@@ -402,6 +411,7 @@ struct ContentView: View {
                 statusMessage: transcriptionEngine?.assetStatus,
                 errorMessage: transcriptionEngine?.lastError,
                 isSaving: isSaving,
+                isStarting: isStarting,
                 onStartCallCapture: { startSession(type: .callCapture) },
                 onStartVoiceMemo: { startSession(type: .voiceMemo) },
                 onStop: stopSession
@@ -556,6 +566,23 @@ struct ContentView: View {
         transcriptionEngine?.isRunning ?? false
     }
 
+    /// One recording at a time: Start is accepted only when nothing is
+    /// starting, recording or saving.
+    private var canStart: Bool {
+        !isStarting && !isRunning && !isSaving && activeSessionType == nil
+    }
+
+    /// Returns true (and beeps) if a recording is already starting,
+    /// running or saving.
+    private func rejectStartIfBusy() -> Bool {
+        guard canStart else {
+            engineLog("[SESSION-GUARD] start ignored: starting=\(isStarting) running=\(isRunning) saving=\(isSaving) active=\(activeSessionType != nil)")
+            NSSound.beep()
+            return true
+        }
+        return false
+    }
+
     private func formatTime(_ s: Int) -> String {
         "\(s / 60):\(String(format: "%02d", s % 60))"
     }
@@ -564,11 +591,9 @@ struct ContentView: View {
 
     /// Start a client-specific recording. Captures frontmost app synchronously before async work.
     private func startClientRecording() {
-        guard !isSaving else {
-            engineLog("[SESSION-GUARD] start ignored: previous session still saving")
-            NSSound.beep()
-            return
-        }
+        if rejectStartIfBusy() { return }
+        isStarting = true
+        stopRequestedDuringStart = false
         let client = clientRegistry.selectedClient
         activeClient = client
         savedFileURL = nil
@@ -591,7 +616,8 @@ struct ContentView: View {
         let sourceApp = appName ?? "Call"
         let preCallNotes = editableContext
 
-        Task {
+        startTask = Task {
+            defer { isStarting = false }
             transcriptionEngine?.lastError = nil
             await sessionStore.startSession()
             do {
@@ -610,6 +636,9 @@ struct ContentView: View {
             if !preCallNotes.isEmpty {
                 await transcriptLogger.updateContext(preCallNotes)
             }
+            // Stop was pressed while the note was being created: don't
+            // start capture. Stop saves the (empty) note.
+            guard !stopRequestedDuringStart else { return }
             activeSessionType = .callCapture
             detectedAppName = appName
             let corrector = buildVocabularyCorrector(client: client)
@@ -624,16 +653,14 @@ struct ContentView: View {
     }
 
     private func startSession(type: SessionType) {
-        guard !isSaving else {
-            engineLog("[SESSION-GUARD] start ignored: previous session still saving")
-            NSSound.beep()
-            return
-        }
+        if rejectStartIfBusy() { return }
         // If in side-by-side mode with a selected client, use client recording
         if clientRegistry.hasClients && clientRegistry.selectedClient != nil && type == .callCapture {
             startClientRecording()
             return
         }
+        isStarting = true
+        stopRequestedDuringStart = false
 
         transcriptStore.clear()
         silenceSeconds = 0
@@ -671,7 +698,8 @@ struct ContentView: View {
 
         let preCallNotes = editableContext
 
-        Task {
+        startTask = Task {
+            defer { isStarting = false }
             transcriptionEngine?.lastError = nil
             await sessionStore.startSession()
             do {
@@ -690,6 +718,7 @@ struct ContentView: View {
             if type == .callCapture && !preCallNotes.isEmpty {
                 await transcriptLogger.updateContext(preCallNotes)
             }
+            guard !stopRequestedDuringStart else { return }
             activeSessionType = type
             detectedAppName = resolvedAppName
             let corrector = buildVocabularyCorrector(client: nil)
@@ -713,14 +742,20 @@ struct ContentView: View {
     }
 
     private func stopSession() {
-        guard !isSaving, isRunning || activeSessionType != nil else { return }
+        guard !isSaving, isStarting || isRunning || activeSessionType != nil else { return }
         isSaving = true
+        stopRequestedDuringStart = true
         activeSessionType = nil
         detectedAppName = nil
         silenceSeconds = 0
+        let pendingStart = startTask
+        startTask = nil
 
         Task {
             savedFileURL = nil
+            // Let an in-flight start finish first, so capture can't begin
+            // after this save completes. engine.stop() also waits for setup.
+            await pendingStart?.value
             await transcriptionEngine?.stop()
             await sessionStore.endSession()
             contextUpdateTask?.cancel()

@@ -34,6 +34,7 @@ struct ControlBar: View {
     let errorMessage: String?
     var activeClientName: String? = nil
     var isSaving: Bool = false
+    var isStarting: Bool = false
     let onStartCallCapture: () -> Void
     let onStartVoiceMemo: () -> Void
     let onStop: () -> Void
@@ -142,7 +143,7 @@ struct ControlBar: View {
                     .buttonStyle(.plain)
                     .keyboardShortcut("r", modifiers: [.command, .shift])
                 }
-                .disabled(isSaving)
+                .disabled(isSaving || isStarting)
                 .opacity(isSaving ? 0.5 : 1)
                 .padding(.horizontal, 12)
                 .padding(.vertical, 10)
