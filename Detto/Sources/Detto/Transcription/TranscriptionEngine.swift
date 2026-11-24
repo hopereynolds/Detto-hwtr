@@ -85,6 +85,16 @@ final class TranscriptionEngine {
     /// Combined audio level from mic and system for the UI meter.
     var audioLevel: Float { max(micCapture.audioLevel, systemCapture.audioLevel) }
 
+    /// The mic has delivered audio since the session (or last mic restart)
+    /// started. Not observable: poll it.
+    var micIsLive: Bool { micCapture.tapIsActive }
+    /// Computer audio has delivered audio, or this session doesn't capture it.
+    var systemIsLive: Bool { !sessionIsCallCapture || systemCapture.hasAudio }
+
+    /// True while start() is still setting up. stop() waits for it, so a
+    /// quick Start-then-Stop can't leave half a session running.
+    private var isStarting = false
+
     // GrembleVoice engines
     private let modelManager: ParakeetModelManager
     private var asrEngine: ParakeetStreamingEngine?
@@ -206,6 +216,9 @@ final class TranscriptionEngine {
         guard await ensureMicrophonePermission() else { return }
 
         isRunning = true
+        isStarting = true
+        defer { isStarting = false }
+        let startedAt = Date()
         self.corrector = vocabularyCorrector
         if let c = vocabularyCorrector {
             engineLog("[ENGINE-VOCAB] Corrector: \(c.termCount) terms, \(c.correctionCount) corrections")
@@ -512,7 +525,8 @@ final class TranscriptionEngine {
         }
 
         assetStatus = "Transcribing (Parakeet-TDT v3)"
-        engineLog("[ENGINE-6] all transcription tasks started")
+        engineLog("[ENGINE-6] all transcription tasks started (\(Int(Date().timeIntervalSince(startedAt) * 1000))ms)")
+        watchFirstAudio(since: startedAt)
 
         installDefaultDeviceListener()
     }
@@ -759,8 +773,44 @@ final class TranscriptionEngine {
         }
     }
 
+    /// Logs when each side first delivers audio, and says so on screen if
+    /// one hasn't after 10 s (the mic opens asynchronously, so its errors
+    /// show up here rather than at start).
+    private func watchFirstAudio(since startedAt: Date) {
+        Task { [weak self] in
+            var micLogged = false
+            var sysLogged = false
+            for _ in 0..<100 {
+                guard let self, self.isRunning else { return }
+                let elapsed = Int(Date().timeIntervalSince(startedAt) * 1000)
+                if !micLogged, self.micIsLive {
+                    engineLog("[ENGINE-LIVE] mic audio flowing (\(elapsed)ms after start)")
+                    micLogged = true
+                }
+                if !sysLogged, self.sessionIsCallCapture, self.systemCapture.hasAudio {
+                    engineLog("[ENGINE-LIVE] system audio flowing (\(elapsed)ms after start)")
+                    sysLogged = true
+                }
+                if micLogged, sysLogged || !self.sessionIsCallCapture { return }
+                try? await Task.sleep(for: .milliseconds(100))
+            }
+            guard let self, self.isRunning else { return }
+            if !self.micIsLive {
+                let detail = self.micCapture.captureError.map { " (\($0))" } ?? ""
+                engineLog("[ENGINE-LIVE-WARN] no mic audio 10s after start\(detail)")
+                self.lastError = "Microphone isn't sending audio\(detail)."
+            } else if !self.systemIsLive, self.lastError == nil {
+                engineLog("[ENGINE-LIVE-WARN] no system audio 10s after start")
+                self.lastError = "Computer audio isn't coming through yet."
+            }
+        }
+    }
+
     func stop() async {
         engineLog("[ENGINE-STOP] stop() called, cancelling all tasks")
+        while isStarting {
+            try? await Task.sleep(for: .milliseconds(50))
+        }
         isRunning = false
 
         await systemCapture.stop()

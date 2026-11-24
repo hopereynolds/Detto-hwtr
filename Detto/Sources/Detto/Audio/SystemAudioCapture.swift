@@ -8,8 +8,11 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
     private let _sysContinuation = OSAllocatedUnfairLock<AsyncStream<AVAudioPCMBuffer>.Continuation?>(uncheckedState: nil)
     private let _micContinuation = OSAllocatedUnfairLock<AsyncStream<AVAudioPCMBuffer>.Continuation?>(uncheckedState: nil)
     private let _audioLevel = AudioLevel()
+    private let _hasAudio = AtomicBool()
 
     var audioLevel: Float { _audioLevel.value }
+    /// True once the current stream has delivered audio.
+    var hasAudio: Bool { _hasAudio.value }
 
     struct CaptureStreams {
         let systemAudio: AsyncStream<AVAudioPCMBuffer>
@@ -17,6 +20,7 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
 
     /// Start capturing system audio. Pass a bundle ID to filter to a specific app.
     func bufferStream(appBundleID: String? = nil) async throws -> CaptureStreams {
+        _hasAudio.value = false
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
 
         guard let display = content.displays.first else {
@@ -65,6 +69,7 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
         _stream.withLock { $0 = nil }
         _sysContinuation.withLock { $0?.finish(); $0 = nil }
         _audioLevel.value = 0
+        _hasAudio.value = false
         _sampleCount.withLock { $0 = 0 }
     }
 
@@ -99,6 +104,7 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
 
         // Diagnostic: log raw system audio levels periodically
         let count = _sampleCount.withLock { val -> Int in val += 1; return val }
+        if count == 1 { _hasAudio.value = true }
         if count <= 5 || count % 200 == 0 {
             engineLog("[SYS-RAW] #\(count) frames=\(frameCount) sr=\(asbd.mSampleRate) ch=\(asbd.mChannelsPerFrame) rms=\(rms)")
         }

@@ -3,7 +3,10 @@ import CoreAudio
 import Foundation
 
 final class MicCapture: @unchecked Sendable {
+    /// Only touched on `queue`.
     private var engine = AVAudioEngine()
+    /// Serializes engine setup and teardown, off the main thread.
+    private let queue = DispatchQueue(label: "detto.mic-capture", qos: .userInitiated)
     private let _audioLevel = AudioLevel()
     private let _error = SyncString()
     private let _tapActive = AtomicBool()
@@ -21,101 +24,111 @@ final class MicCapture: @unchecked Sendable {
         return AsyncStream { continuation in
             errorHolder.value = nil
 
-            engineLog("[MIC-1] bufferStream called, deviceID=\(String(describing: deviceID))")
+            // Set up off the caller's thread. Opening an input device can
+            // block for seconds (about 3 s per step when the default input is
+            // a Bluetooth headset), and the caller is the main thread: the
+            // window froze and system audio waited behind it.
+            self.queue.async {
+                engineLog("[MIC-1] bufferStream called, deviceID=\(String(describing: deviceID))")
 
-            // Set input device before accessing inputNode format
-            if let id = deviceID {
-                let inputNode = self.engine.inputNode
-                guard let audioUnit = inputNode.audioUnit else {
-                    errorHolder.value = "Failed to access audio unit for input device"
-                    continuation.finish()
-                    return
+                // Set input device before accessing inputNode format
+                if let id = deviceID {
+                    let inputNode = self.engine.inputNode
+                    guard let audioUnit = inputNode.audioUnit else {
+                        errorHolder.value = "Failed to access audio unit for input device"
+                        continuation.finish()
+                        return
+                    }
+                    var devID = id
+                    let status = AudioUnitSetProperty(
+                        audioUnit,
+                        kAudioOutputUnitProperty_CurrentDevice,
+                        kAudioUnitScope_Global,
+                        0,
+                        &devID,
+                        UInt32(MemoryLayout<AudioDeviceID>.size)
+                    )
+                    engineLog("[MIC-2] setInputDevice status=\(status) (0=ok)")
+                    guard status == noErr else {
+                        let msg = "Failed to set input device (OSStatus \(status))"
+                        engineLog("[MIC-2-FAIL] \(msg)")
+                        errorHolder.value = msg
+                        continuation.finish()
+                        return
+                    }
+                } else {
+                    engineLog("[MIC-2] no deviceID, using system default")
                 }
-                var devID = id
-                let status = AudioUnitSetProperty(
-                    audioUnit,
-                    kAudioOutputUnitProperty_CurrentDevice,
-                    kAudioUnitScope_Global,
-                    0,
-                    &devID,
-                    UInt32(MemoryLayout<AudioDeviceID>.size)
-                )
-                engineLog("[MIC-2] setInputDevice status=\(status) (0=ok)")
-                guard status == noErr else {
-                    let msg = "Failed to set input device (OSStatus \(status))"
-                    engineLog("[MIC-2-FAIL] \(msg)")
+
+                let inputNode = self.engine.inputNode
+                let format = inputNode.inputFormat(forBus: 0)
+
+                engineLog("[MIC-3] inputNode format: sr=\(format.sampleRate) ch=\(format.channelCount) interleaved=\(format.isInterleaved) commonFormat=\(format.commonFormat.rawValue)")
+
+                guard format.sampleRate > 0 && format.channelCount > 0 else {
+                    let msg = "Invalid audio format: sr=\(format.sampleRate) ch=\(format.channelCount)"
+                    engineLog("[MIC-3-FAIL] \(msg)")
                     errorHolder.value = msg
                     continuation.finish()
                     return
                 }
-            } else {
-                engineLog("[MIC-2] no deviceID, using system default")
-            }
 
-            let inputNode = self.engine.inputNode
-            let format = inputNode.inputFormat(forBus: 0)
-
-            engineLog("[MIC-3] inputNode format: sr=\(format.sampleRate) ch=\(format.channelCount) interleaved=\(format.isInterleaved) commonFormat=\(format.commonFormat.rawValue)")
-
-            guard format.sampleRate > 0 && format.channelCount > 0 else {
-                let msg = "Invalid audio format: sr=\(format.sampleRate) ch=\(format.channelCount)"
-                engineLog("[MIC-3-FAIL] \(msg)")
-                errorHolder.value = msg
-                continuation.finish()
-                return
-            }
-
-            guard let tapFormat = AVAudioFormat(
-                standardFormatWithSampleRate: format.sampleRate,
-                channels: format.channelCount
-            ) else {
-                let msg = "Failed to build tap format from input format"
-                engineLog("[MIC-4-FAIL] \(msg)")
-                errorHolder.value = msg
-                continuation.finish()
-                return
-            }
-
-            engineLog("[MIC-4] tapFormat: sr=\(tapFormat.sampleRate) ch=\(tapFormat.channelCount)")
-
-            var tapCallCount = 0
-            inputNode.installTap(onBus: 0, bufferSize: 4096, format: tapFormat) { buffer, _ in
-                tapCallCount += 1
-                if tapCallCount == 1 { tapActive.value = true }
-                let rms = Self.normalizedRMS(from: buffer)
-                level.value = min(rms * 25, 1.0)
-
-                if tapCallCount <= 5 || tapCallCount % 100 == 0 {
-                    engineLog("[MIC-6] tap #\(tapCallCount): frames=\(buffer.frameLength) rms=\(rms) level=\(level.value)")
+                guard let tapFormat = AVAudioFormat(
+                    standardFormatWithSampleRate: format.sampleRate,
+                    channels: format.channelCount
+                ) else {
+                    let msg = "Failed to build tap format from input format"
+                    engineLog("[MIC-4-FAIL] \(msg)")
+                    errorHolder.value = msg
+                    continuation.finish()
+                    return
                 }
 
-                continuation.yield(buffer)
-            }
+                engineLog("[MIC-4] tapFormat: sr=\(tapFormat.sampleRate) ch=\(tapFormat.channelCount)")
 
-            engineLog("[MIC-5] tap installed, preparing engine...")
+                var tapCallCount = 0
+                inputNode.installTap(onBus: 0, bufferSize: 4096, format: tapFormat) { buffer, _ in
+                    tapCallCount += 1
+                    if tapCallCount == 1 { tapActive.value = true }
+                    let rms = Self.normalizedRMS(from: buffer)
+                    level.value = min(rms * 25, 1.0)
 
-            do {
-                self.engine.prepare()
-                engineLog("[MIC-7] engine prepared, starting...")
-                try self.engine.start()
-                engineLog("[MIC-8] engine started successfully, isRunning=\(self.engine.isRunning)")
-            } catch {
-                let msg = "Mic failed: \(error.localizedDescription)"
-                engineLog("[MIC-8-FAIL] \(msg)")
-                errorHolder.value = msg
-                continuation.finish()
+                    if tapCallCount <= 5 || tapCallCount % 100 == 0 {
+                        engineLog("[MIC-6] tap #\(tapCallCount): frames=\(buffer.frameLength) rms=\(rms) level=\(level.value)")
+                    }
+
+                    continuation.yield(buffer)
+                }
+
+                engineLog("[MIC-5] tap installed, preparing engine...")
+
+                do {
+                    self.engine.prepare()
+                    engineLog("[MIC-7] engine prepared, starting...")
+                    try self.engine.start()
+                    engineLog("[MIC-8] engine started successfully, isRunning=\(self.engine.isRunning)")
+                } catch {
+                    let msg = "Mic failed: \(error.localizedDescription)"
+                    engineLog("[MIC-8-FAIL] \(msg)")
+                    errorHolder.value = msg
+                    continuation.finish()
+                }
             }
         }
     }
 
+    /// Stops capture. Teardown runs on `queue`, after any setup still in
+    /// progress, so a following `bufferStream` always gets a fresh engine.
     func stop() {
-        let stopped = engine
-        stopped.inputNode.removeTap(onBus: 0)
-        stopped.stop()
-        engine = AVAudioEngine()
-        Self.retire(stopped)
         _audioLevel.value = 0
         _tapActive.value = false
+        queue.async {
+            let stopped = self.engine
+            stopped.inputNode.removeTap(onBus: 0)
+            stopped.stop()
+            self.engine = AVAudioEngine()
+            Self.retire(stopped)
+        }
     }
 
     /// How long a stopped engine is kept alive before it's released.

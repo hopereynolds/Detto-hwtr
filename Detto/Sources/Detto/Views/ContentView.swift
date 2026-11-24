@@ -34,6 +34,10 @@ struct ContentView: View {
     /// Starting a new session meanwhile would clear the transcript the old
     /// one is still saving, leaving an empty note (Nov 4).
     @State private var isSaving = false
+    /// Whether each side of the recording is actually delivering audio.
+    /// Polled from the engine with the level meter.
+    @State private var micIsLive = false
+    @State private var systemIsLive = false
     @State private var activeClient: ClientInfo?
     @State private var detectedAppName: String?
     @State private var silenceSeconds: Int = 0
@@ -117,6 +121,10 @@ struct ContentView: View {
                     if audioLevel != 0 { audioLevel = 0 }
                     continue
                 }
+                let mic = engine.isRunning && engine.micIsLive
+                let system = engine.isRunning && engine.systemIsLive
+                if mic != micIsLive { micIsLive = mic }
+                if system != systemIsLive { systemIsLive = system }
                 if engine.isRunning {
                     let newLevel = engine.audioLevel
                     if abs(newLevel - audioLevel) > 0.005 { audioLevel = newLevel }
@@ -435,7 +443,7 @@ struct ContentView: View {
                         .font(.dMono(size: 11, weight: .semibold).monospacedDigit())
                         .foregroundStyle(Color.dText)
 
-                    PulsingDot(size: 6)
+                    liveIndicator
                 } else {
                     Text("ON-DEVICE")
                         .font(.dMono(size: 9, weight: .bold))
@@ -451,6 +459,44 @@ struct ContentView: View {
         .padding(.horizontal, 16)
         .frame(height: 44)
         .background(Color.dSurface)
+    }
+
+    // MARK: - Live Indicator
+
+    /// "LIVE" only once audio is actually arriving from every side this
+    /// session records. Until then, says what it's waiting for.
+    @ViewBuilder
+    private var liveIndicator: some View {
+        if micIsLive && systemIsLive {
+            HStack(spacing: 6) {
+                Text("LIVE")
+                    .font(.dMono(size: 9, weight: .bold))
+                    .tracking(1)
+                    .foregroundStyle(Color.dRed)
+                PulsingDot(size: 6)
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("Recording is live")
+        } else {
+            HStack(spacing: 6) {
+                Text(waitingLabel)
+                    .font(.dMono(size: 9, weight: .bold))
+                    .tracking(1)
+                    .foregroundStyle(Color.dAmber)
+                ProgressView()
+                    .controlSize(.mini)
+                    .tint(Color.dAmber)
+            }
+            .accessibilityElement(children: .combine)
+        }
+    }
+
+    private var waitingLabel: String {
+        switch (micIsLive, systemIsLive) {
+        case (false, false): return "STARTING"
+        case (false, true): return "WAITING FOR MIC"
+        default: return "WAITING FOR CALL AUDIO"
+        }
     }
 
     // MARK: - Empty State
