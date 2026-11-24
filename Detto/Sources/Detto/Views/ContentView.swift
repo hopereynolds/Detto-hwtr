@@ -486,7 +486,20 @@ struct ContentView: View {
     /// session records. Until then, says what it's waiting for.
     @ViewBuilder
     private var liveIndicator: some View {
-        if transcriptionEngine?.systemAudioStopped == true {
+        if transcriptionEngine?.systemAudioStopped == true, !micIsLive {
+            // Neither side is being recorded right now.
+            HStack(spacing: 6) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(Color.dRed)
+                Text("BOTH SIDES LOST")
+                    .font(.dMono(size: 9, weight: .bold))
+                    .tracking(1)
+                    .foregroundStyle(Color.dRed)
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("Both sides lost. Neither you nor the other side is being recorded.")
+        } else if transcriptionEngine?.systemAudioStopped == true {
             // Lost beats LIVE and STARTING: the other side isn't recorded.
             HStack(spacing: 6) {
                 Image(systemName: "exclamationmark.triangle.fill")

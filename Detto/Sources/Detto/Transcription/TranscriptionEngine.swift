@@ -124,6 +124,22 @@ final class TranscriptionEngine {
     enum MicStatus { case starting, live, reconnecting, lost }
     private(set) var micStatus: MicStatus = .starting
     private static let micLostMessage = "Your microphone stopped and couldn't be reconnected, so your side isn't being recorded. Stop and start again, or check the input in System Settings."
+    private static let callAudioLostMessage = "Computer audio stopped, so the other side isn't being recorded."
+    private static let bothLostMessage = "Neither side is being recorded: computer audio stopped and the microphone couldn't be reconnected. Stop and start again."
+    private static var lossMessages: [String] { [micLostMessage, callAudioLostMessage, bothLostMessage] }
+
+    /// Sets the loss message from the current state of both sides, so it
+    /// never reassures about a side that's also gone. Leaves other errors
+    /// (e.g. screen-recording instructions) alone.
+    private func refreshLossMessage() {
+        guard lastError == nil || Self.lossMessages.contains(lastError ?? "") else { return }
+        switch (systemAudioStopped, micStatus == .lost) {
+        case (true, true): lastError = Self.bothLostMessage
+        case (true, false): lastError = Self.callAudioLostMessage
+        case (false, true): lastError = Self.micLostMessage
+        case (false, false): lastError = nil
+        }
+    }
     /// When the current mic open began (Start, device change or retry).
     private var micAttemptStartedAt: Date?
     /// How long an open may take before its first buffer: direct path
@@ -565,9 +581,7 @@ final class TranscriptionEngine {
         guard isRunning, sessionIsCallCapture else { return }
         engineLog("[ENGINE-SYS-LOST] call audio stream stopped: \(error.localizedDescription)")
         systemAudioStopped = true
-        lastError = micIsLive
-            ? "Computer audio stopped, so the other side isn't being recorded. Your mic is still recording."
-            : "Computer audio stopped, so the other side isn't being recorded."
+        refreshLossMessage()
     }
 
     /// Restart only the mic capture with a new device, keeping system audio and models intact.
@@ -869,7 +883,7 @@ final class TranscriptionEngine {
                         }
                         self.micStatus = .live
                         retries = 0
-                        if self.lastError == Self.micLostMessage { self.lastError = nil }
+                        self.refreshLossMessage()
                     }
                     continue
                 }
@@ -887,7 +901,7 @@ final class TranscriptionEngine {
                     engineLog("[ENGINE-MIC-WATCH] giving up after \(retries) reconnects")
                     self.micStatus = .lost
                     // Explain it, unless another instruction is showing.
-                    if self.lastError == nil { self.lastError = Self.micLostMessage }
+                    self.refreshLossMessage()
                     continue
                 }
                 retries += 1
