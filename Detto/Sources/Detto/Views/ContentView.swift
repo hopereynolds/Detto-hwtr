@@ -501,17 +501,26 @@ struct ContentView: View {
             .accessibilityLabel("Both sides lost. Neither you nor the other side is being recorded.")
         } else if transcriptionEngine?.systemAudioStopped == true {
             // Lost beats LIVE and STARTING: the other side isn't recorded.
+            // Red even while reconnecting, because nothing is recorded yet.
+            let reconnecting = transcriptionEngine?.systemAudioReconnecting == true
             HStack(spacing: 6) {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .font(.system(size: 9, weight: .bold))
                     .foregroundStyle(Color.dRed)
-                Text("CALL AUDIO LOST")
+                Text(reconnecting ? "RECONNECTING CALL AUDIO" : "CALL AUDIO LOST")
                     .font(.dMono(size: 9, weight: .bold))
                     .tracking(1)
                     .foregroundStyle(Color.dRed)
+                if reconnecting {
+                    ProgressView()
+                        .controlSize(.mini)
+                        .tint(Color.dRed)
+                }
             }
             .accessibilityElement(children: .combine)
-            .accessibilityLabel("Call audio lost. The other side isn't being recorded.")
+            .accessibilityLabel(reconnecting
+                ? "Call audio lost. Reconnecting. The other side isn't being recorded until it's back."
+                : "Call audio lost. The other side isn't being recorded. Stop and start again.")
         } else if !micIsLive, transcriptionEngine?.micStatus == .lost {
             // Retries are exhausted: no spinner, nothing is in progress.
             HStack(spacing: 6) {

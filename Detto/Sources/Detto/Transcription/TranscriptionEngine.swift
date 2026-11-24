@@ -90,8 +90,16 @@ final class TranscriptionEngine {
     var micIsLive: Bool { micCapture.tapIsActive }
     /// Computer audio has delivered audio, or this session doesn't capture it.
     var systemIsLive: Bool { !sessionIsCallCapture || systemCapture.hasAudio }
-    /// macOS stopped the call-audio stream during this session.
+    /// macOS stopped the call-audio stream during this session and it
+    /// hasn't come back yet.
     private(set) var systemAudioStopped = false
+    /// Trying to bring the call audio back (true only while stopped).
+    private(set) var systemAudioReconnecting = false
+    private var systemRestartTask: Task<Void, Never>?
+    /// Waits before each reconnect attempt: about a minute in all.
+    private static let systemRestartDelays: [Duration] = [.seconds(1), .seconds(2), .seconds(4), .seconds(8), .seconds(15)]
+    /// How long a new stream gets to deliver before the next attempt.
+    private static let systemFirstSampleDeadline: Duration = .seconds(5)
 
     /// True while start() is still setting up. stop() waits for it, so a
     /// quick Start-then-Stop can't leave half a session running.
@@ -124,9 +132,10 @@ final class TranscriptionEngine {
     enum MicStatus { case starting, live, reconnecting, lost }
     private(set) var micStatus: MicStatus = .starting
     private static let micLostMessage = "Your microphone stopped and couldn't be reconnected, so your side isn't being recorded. Stop and start again, or check the input in System Settings."
-    private static let callAudioLostMessage = "Computer audio stopped, so the other side isn't being recorded."
+    private static let callAudioReconnectingMessage = "Computer audio stopped, so the other side isn't being recorded. Reconnecting…"
+    private static let callAudioLostMessage = "Computer audio stopped and couldn't be reconnected, so the other side isn't being recorded. Stop and start again."
     private static let bothLostMessage = "Neither side is being recorded: computer audio stopped and the microphone couldn't be reconnected. Stop and start again."
-    private static var lossMessages: [String] { [micLostMessage, callAudioLostMessage, bothLostMessage] }
+    private static var lossMessages: [String] { [micLostMessage, callAudioReconnectingMessage, callAudioLostMessage, bothLostMessage] }
 
     /// Sets the loss message from the current state of both sides, so it
     /// never reassures about a side that's also gone. Leaves other errors
@@ -135,7 +144,8 @@ final class TranscriptionEngine {
         guard lastError == nil || Self.lossMessages.contains(lastError ?? "") else { return }
         switch (systemAudioStopped, micStatus == .lost) {
         case (true, true): lastError = Self.bothLostMessage
-        case (true, false): lastError = Self.callAudioLostMessage
+        case (true, false):
+            lastError = systemAudioReconnecting ? Self.callAudioReconnectingMessage : Self.callAudioLostMessage
         case (false, true): lastError = Self.micLostMessage
         case (false, false): lastError = nil
         }
@@ -575,13 +585,59 @@ final class TranscriptionEngine {
         return true
     }
 
-    /// macOS ended the call-audio stream. Drop LIVE and say so; the mic
-    /// keeps recording.
+    /// macOS ended the call-audio stream. Drop LIVE, say so and try to
+    /// bring it back; the mic keeps recording.
     private func systemStreamStopped(_ error: any Error) {
         guard isRunning, sessionIsCallCapture else { return }
         engineLog("[ENGINE-SYS-LOST] call audio stream stopped: \(error.localizedDescription)")
         systemAudioStopped = true
+        // A replacement that stops again is handled by the attempt loop.
+        if systemRestartTask == nil {
+            systemAudioReconnecting = true
+            startSystemRestart()
+        }
         refreshLossMessage()
+    }
+
+    /// Reopens the call audio with the same filter, feeding the same
+    /// pipeline (SystemAudioCapture fills the gap with silence). Each
+    /// attempt waits a bit longer; a new stream counts once it delivers.
+    /// Stop cancels it, and SystemAudioCapture drops a stream that opens
+    /// after Stop.
+    private func startSystemRestart() {
+        systemRestartTask = Task { [weak self] in
+            for (index, delay) in Self.systemRestartDelays.enumerated() {
+                let attempt = index + 1
+                try? await Task.sleep(for: delay)
+                guard let self, self.isRunning, !Task.isCancelled else { return }
+                engineLog("[ENGINE-SYS-RESTART] reconnecting call audio, attempt \(attempt)")
+                do {
+                    guard try await self.systemCapture.restart() else { return }
+                } catch {
+                    engineLog("[ENGINE-SYS-RESTART] attempt \(attempt) failed: \(error.localizedDescription)")
+                    continue
+                }
+                let deadline = ContinuousClock.now + Self.systemFirstSampleDeadline
+                while ContinuousClock.now < deadline {
+                    try? await Task.sleep(for: .milliseconds(200))
+                    guard self.isRunning, !Task.isCancelled else { return }
+                    if self.systemCapture.hasAudio {
+                        engineLog("[ENGINE-SYS-RESTART] call audio is back (attempt \(attempt))")
+                        self.systemRestartTask = nil
+                        self.systemAudioReconnecting = false
+                        self.systemAudioStopped = false
+                        self.refreshLossMessage()
+                        return
+                    }
+                }
+                engineLog("[ENGINE-SYS-RESTART] attempt \(attempt): no audio within \(Self.systemFirstSampleDeadline)")
+            }
+            guard let self, self.isRunning, !Task.isCancelled else { return }
+            engineLog("[ENGINE-SYS-RESTART] giving up after \(Self.systemRestartDelays.count) attempts")
+            self.systemRestartTask = nil
+            self.systemAudioReconnecting = false
+            self.refreshLossMessage()
+        }
     }
 
     /// Restart only the mic capture with a new device, keeping system audio and models intact.
@@ -921,6 +977,9 @@ final class TranscriptionEngine {
         isRunning = false
 
         systemCapture.setOnStreamStopped(nil)
+        systemRestartTask?.cancel()
+        systemRestartTask = nil
+        systemAudioReconnecting = false
         await systemCapture.stop()
         // Wait for the mic to actually stop (and cancel a setup still
         // opening the device), so nothing turns it on after Stop finishes.
