@@ -331,8 +331,8 @@ final class TranscriptionEngine {
 
         // 3. Start system audio capture (skipped for mic-only mode)
         systemAudioStopped = false
-        systemCapture.setOnStreamStopped { [weak self] error in
-            Task { @MainActor in self?.systemStreamStopped(error) }
+        systemCapture.setOnStreamStopped { [weak self] generation, error in
+            Task { @MainActor in self?.systemStreamStopped(error, generation: generation) }
         }
         engineLog("[ENGINE-4] starting system audio capture...")
         let sysStreams: SystemAudioCapture.CaptureStreams?
@@ -587,8 +587,13 @@ final class TranscriptionEngine {
 
     /// macOS ended the call-audio stream. Drop LIVE, say so and try to
     /// bring it back; the mic keeps recording.
-    private func systemStreamStopped(_ error: any Error) {
+    private func systemStreamStopped(_ error: any Error, generation: Int) {
         guard isRunning, sessionIsCallCapture else { return }
+        // A late notice from a recording that has since been stopped.
+        guard generation == systemCapture.generation else {
+            engineLog("[ENGINE-SYS-LOST] ignored a stop notice from an earlier recording")
+            return
+        }
         engineLog("[ENGINE-SYS-LOST] call audio stream stopped: \(error.localizedDescription)")
         systemAudioStopped = true
         // A replacement that stops again is handled by the attempt loop.
@@ -618,19 +623,28 @@ final class TranscriptionEngine {
                     continue
                 }
                 let deadline = ContinuousClock.now + Self.systemFirstSampleDeadline
-                while ContinuousClock.now < deadline {
+                var live = false
+                while !live, ContinuousClock.now < deadline {
                     try? await Task.sleep(for: .milliseconds(200))
                     guard self.isRunning, !Task.isCancelled else { return }
-                    if self.systemCapture.hasAudio {
-                        engineLog("[ENGINE-SYS-RESTART] call audio is back (attempt \(attempt))")
-                        self.systemRestartTask = nil
-                        self.systemAudioReconnecting = false
-                        self.systemAudioStopped = false
-                        self.refreshLossMessage()
-                        return
-                    }
+                    live = self.systemCapture.hasAudio
                 }
-                engineLog("[ENGINE-SYS-RESTART] attempt \(attempt): no audio within \(Self.systemFirstSampleDeadline)")
+                // Missed the deadline: close it, so it can't come alive
+                // behind the next attempt or after giving up. If it went
+                // live at the last moment, keep it.
+                if !live {
+                    live = await self.systemCapture.closeReplacementIfSilent()
+                    guard self.isRunning, !Task.isCancelled else { return }
+                }
+                if live {
+                    engineLog("[ENGINE-SYS-RESTART] call audio is back (attempt \(attempt))")
+                    self.systemRestartTask = nil
+                    self.systemAudioReconnecting = false
+                    self.systemAudioStopped = false
+                    self.refreshLossMessage()
+                    return
+                }
+                engineLog("[ENGINE-SYS-RESTART] attempt \(attempt): no audio within \(Self.systemFirstSampleDeadline), closed it")
             }
             guard let self, self.isRunning, !Task.isCancelled else { return }
             engineLog("[ENGINE-SYS-RESTART] giving up after \(Self.systemRestartDelays.count) attempts")

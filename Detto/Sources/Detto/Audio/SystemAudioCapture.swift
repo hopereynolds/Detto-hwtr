@@ -4,49 +4,73 @@ import CoreMedia
 import os
 
 final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate, SCStreamOutput {
-    /// The current stream and whether it has delivered audio, under one
-    /// lock: a stream that stops is invalidated in the same step that
-    /// clears readiness, so a sample callback already in flight can't mark
-    /// it live again.
-    private struct StreamState {
+    /// Which audio a recording captures. Decided once at the first open and
+    /// kept for every reconnect, so a reconnect never widens an app-only
+    /// recording to everything the Mac is playing.
+    private enum Scope {
+        case app(String)
+        case allSystemAudio
+    }
+
+    /// Everything about the current recording, under one lock, so Stop
+    /// invalidates the stream, its readiness and the consumer in one step,
+    /// and a callback that passed the identity check can only yield into
+    /// the recording it belongs to.
+    private struct State {
+        /// Bumped by bufferStream() and stop(); an open in flight checks it.
+        var generation = 0
+        var scope: Scope?
+        var continuation: AsyncStream<AVAudioPCMBuffer>.Continuation?
+        /// The stream currently allowed to deliver.
         var stream: SCStream?
         var hasAudio = false
         var sampleCount = 0
-    }
-    private let _state = OSAllocatedUnfairLock<StreamState>(uncheckedState: StreamState())
-
-    /// What survives a stream being replaced: the app the session filters
-    /// to, a counter that stop() bumps so a restart in flight can't outlive
-    /// it, and when the last sample arrived, so the gap a replacement
-    /// leaves can be filled with silence (keeps the timeline, temp audio
-    /// and speaker labels in step with the mic side).
-    private struct SessionState {
-        var appBundleID: String?
-        var generation = 0
+        /// When the last real sample arrived, for filling a reconnect's gap.
         var lastSampleAt: Date?
-        var fillGapOnNextSample = false
+        /// The current stream is a replacement that hasn't delivered yet.
+        var fillGapOnFirstSample = false
+        /// Opens that haven't finished; stop() waits for them.
+        var opening = 0
     }
-    private let _session = OSAllocatedUnfairLock<SessionState>(uncheckedState: SessionState())
-    /// Longest gap filled with silence after a restart.
-    private static let maxGapFill: TimeInterval = 120
-    private let _sysContinuation = OSAllocatedUnfairLock<AsyncStream<AVAudioPCMBuffer>.Continuation?>(uncheckedState: nil)
+    private let _state = OSAllocatedUnfairLock<State>(uncheckedState: State())
     private let _micContinuation = OSAllocatedUnfairLock<AsyncStream<AVAudioPCMBuffer>.Continuation?>(uncheckedState: nil)
     private let _audioLevel = AudioLevel()
+    /// Serial, so a replacement's gap silence and first buffer go out
+    /// before anything that follows them.
+    private let sampleQueue = DispatchQueue(label: "detto.system-audio", qos: .userInteractive)
+    /// Longest gap filled with silence after a reconnect.
+    private static let maxGapFill: TimeInterval = 120
 
     var audioLevel: Float { _audioLevel.value }
     /// True once the current stream has delivered audio, until it stops.
     var hasAudio: Bool { _state.withLock { $0.hasAudio } }
+    /// Identifies the current recording; stop-notices carry it.
+    var generation: Int { _state.withLock { $0.generation } }
 
     /// Called (on a capture thread) when macOS stops the current stream
-    /// with an error, e.g. -3815. Not called for stop().
-    private let _onStreamStopped = OSAllocatedUnfairLock<(@Sendable (any Error) -> Void)?>(uncheckedState: nil)
-    func setOnStreamStopped(_ handler: (@Sendable (any Error) -> Void)?) {
+    /// with an error, e.g. -3815, with the recording's generation. Not
+    /// called for stop().
+    private let _onStreamStopped = OSAllocatedUnfairLock<(@Sendable (Int, any Error) -> Void)?>(uncheckedState: nil)
+    func setOnStreamStopped(_ handler: (@Sendable (Int, any Error) -> Void)?) {
         _onStreamStopped.withLock { $0 = handler }
     }
 
-
     struct CaptureStreams {
         let systemAudio: AsyncStream<AVAudioPCMBuffer>
+    }
+
+    enum CaptureError: Error, LocalizedError {
+        case noDisplay
+        case appNotFound(String)
+        case stopped
+
+        var errorDescription: String? {
+            switch self {
+            case .noDisplay: return "No display to capture from."
+            case .appNotFound(let id): return "\(id) isn't available to capture."
+            case .stopped: return "Recording stopped."
+            }
+        }
     }
 
     /// Start capturing system audio. Pass a bundle ID to filter to a specific app.
@@ -54,63 +78,98 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
     /// The returned stream outlives any one SCStream: `restart()` replaces
     /// a stream macOS stopped and keeps feeding the same consumer.
     func bufferStream(appBundleID: String? = nil) async throws -> CaptureStreams {
-        _state.withLock { $0 = StreamState() }
-        let generation = _session.withLock { session -> Int in
-            session.generation += 1
-            session.appBundleID = appBundleID
-            session.lastSampleAt = nil
-            session.fillGapOnNextSample = false
-            return session.generation
+        let (sysStream, continuation) = AsyncStream<AVAudioPCMBuffer>.makeStream()
+        let (generation, previous) = _state.withLock { state -> (Int, AsyncStream<AVAudioPCMBuffer>.Continuation?) in
+            let previous = state.continuation
+            let generation = state.generation + 1
+            state = State(generation: generation, continuation: continuation, opening: state.opening)
+            return (generation, previous)
         }
-        let sysStream = AsyncStream<AVAudioPCMBuffer> { cont in
-            self._sysContinuation.withLock { $0 = cont }
-        }
-        try await startStream(appBundleID: appBundleID, generation: generation)
+        previous?.finish()
+        try await open(generation: generation, requestedAppBundleID: appBundleID)
         return CaptureStreams(systemAudio: sysStream)
     }
 
-    /// Replace a stream macOS stopped, with the same filter, feeding the
-    /// same consumer. Returns false if the session was stopped meanwhile.
+    /// Replace a stream macOS stopped (or a replacement that never
+    /// delivered), with the same scope, feeding the same consumer.
+    /// Throws if the attempt fails; returns false if Stop ran meanwhile.
     func restart() async throws -> Bool {
-        guard _sysContinuation.withLock({ $0 != nil }) else { return false }
-        // A previous attempt's stream that never delivered: stop it first.
-        let previous = _state.withLock { state -> SCStream? in
-            let stream = state.stream
-            state = StreamState()
-            return stream
-        }
-        let (appBundleID, generation) = _session.withLock { session in
-            session.fillGapOnNextSample = true
-            return (session.appBundleID, session.generation)
+        let (generation, previous) = _state.withLock { state -> (Int?, SCStream?) in
+            guard state.continuation != nil, state.scope != nil else { return (nil, nil) }
+            let previous = state.stream
+            state.stream = nil
+            state.hasAudio = false
+            state.sampleCount = 0
+            return (state.generation, previous)
         }
         try? await previous?.stopCapture()
-        guard isCurrent(generation) else { return false }
-        try await startStream(appBundleID: appBundleID, generation: generation)
-        return isCurrent(generation)
+        guard let generation else { return false }
+        do {
+            try await open(generation: generation, requestedAppBundleID: nil)
+        } catch CaptureError.stopped {
+            return false
+        }
+        return true
     }
 
-    private func isCurrent(_ generation: Int) -> Bool {
-        _session.withLock { $0.generation == generation } && _sysContinuation.withLock { $0 != nil }
+    /// After a replacement missed its deadline: if it still hasn't
+    /// delivered, close it so it can't come alive behind a retry or after
+    /// giving up. Returns true if it's live after all.
+    func closeReplacementIfSilent() async -> Bool {
+        let silent = _state.withLock { state -> SCStream? in
+            guard !state.hasAudio else { return nil }
+            let stream = state.stream
+            state.stream = nil
+            return stream
+        }
+        if let silent {
+            engineLog("[SYS-RESTART] closing a replacement that never delivered")
+            try? await silent.stopCapture()
+            return false
+        }
+        return hasAudio
     }
 
-    private func startStream(appBundleID: String?, generation: Int) async throws {
+    /// Opens a stream for `generation`. The first open resolves the scope
+    /// (per-app when the app is there, otherwise all system audio, as
+    /// before); later opens keep it and fail if the app is missing.
+    private func open(generation: Int, requestedAppBundleID: String?) async throws {
+        _state.withLock { $0.opening += 1 }
+        defer { _state.withLock { $0.opening -= 1 } }
+
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
-
         guard let display = content.displays.first else {
             throw CaptureError.noDisplay
         }
 
-        // Build content filter — per-app if possible, otherwise all system audio
+        // A scope already set means an earlier open of this recording ran.
+        let (savedScope, isReplacement) = _state.withLock { ($0.scope, $0.scope != nil) }
         let filter: SCContentFilter
-        if let bundleID = appBundleID,
-           let matchedApp = content.applications.first(where: { $0.bundleIdentifier == bundleID }) {
-            engineLog("[SYS-FILTER] Per-app filter: \(bundleID)")
-            filter = SCContentFilter(display: display, including: [matchedApp], exceptingWindows: [])
-        } else {
-            if let bundleID = appBundleID {
-                engineLog("[SYS-FILTER] App \(bundleID) not found in shareable content, falling back to all system audio")
+        let scope: Scope
+        switch savedScope {
+        case .app(let bundleID):
+            guard let app = content.applications.first(where: { $0.bundleIdentifier == bundleID }) else {
+                engineLog("[SYS-FILTER] \(bundleID) not in shareable content; not widening to all system audio")
+                throw CaptureError.appNotFound(bundleID)
             }
+            filter = SCContentFilter(display: display, including: [app], exceptingWindows: [])
+            scope = .app(bundleID)
+        case .allSystemAudio:
             filter = SCContentFilter(display: display, excludingWindows: [])
+            scope = .allSystemAudio
+        case nil:
+            if let bundleID = requestedAppBundleID,
+               let matchedApp = content.applications.first(where: { $0.bundleIdentifier == bundleID }) {
+                engineLog("[SYS-FILTER] Per-app filter: \(bundleID)")
+                filter = SCContentFilter(display: display, including: [matchedApp], exceptingWindows: [])
+                scope = .app(bundleID)
+            } else {
+                if let bundleID = requestedAppBundleID {
+                    engineLog("[SYS-FILTER] App \(bundleID) not found in shareable content, falling back to all system audio")
+                }
+                filter = SCContentFilter(display: display, excludingWindows: [])
+                scope = .allSystemAudio
+            }
         }
 
         let config = SCStreamConfiguration()
@@ -125,43 +184,51 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
         config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
 
         let scStream = SCStream(filter: filter, configuration: config, delegate: self)
-        try scStream.addStreamOutput(self, type: .audio, sampleHandlerQueue: .global(qos: .userInteractive))
+        try scStream.addStreamOutput(self, type: .audio, sampleHandlerQueue: sampleQueue)
 
-        // stop() may have run while shareable content was loading.
-        guard isCurrent(generation) else { return }
-        _state.withLock { $0 = StreamState(stream: scStream) }
+        // Commit the stream to this recording in the same step that checks
+        // the recording is still current.
+        let committed = _state.withLock { state -> Bool in
+            guard state.generation == generation, state.continuation != nil else { return false }
+            state.scope = scope
+            state.stream = scStream
+            state.hasAudio = false
+            state.sampleCount = 0
+            state.fillGapOnFirstSample = isReplacement
+            return true
+        }
+        guard committed else { throw CaptureError.stopped }
+
         do {
             try await scStream.startCapture()
         } catch {
             _state.withLock { state in
-                if state.stream === scStream { state = StreamState() }
+                if state.stream === scStream { state.stream = nil }
             }
             throw error
         }
-        // And while it was starting: don't leave it running.
-        if !isCurrent(generation) {
-            _state.withLock { state in
-                if state.stream === scStream { state = StreamState() }
-            }
+        // Stop (or a newer attempt) may have run while it was starting.
+        let stillCurrent = _state.withLock { $0.stream === scStream }
+        if !stillCurrent {
             try? await scStream.stopCapture()
+            throw CaptureError.stopped
         }
     }
 
     func stop() async {
-        _session.withLock { session in
-            session.generation += 1
-            session.appBundleID = nil
-            session.lastSampleAt = nil
-            session.fillGapOnNextSample = false
+        let (stream, continuation) = _state.withLock { state -> (SCStream?, AsyncStream<AVAudioPCMBuffer>.Continuation?) in
+            let taken = (state.stream, state.continuation)
+            state = State(generation: state.generation + 1, opening: state.opening)
+            return taken
         }
-        let stream = _state.withLock { state -> SCStream? in
-            let stream = state.stream
-            state = StreamState()
-            return stream
-        }
-        try? await stream?.stopCapture()
-        _sysContinuation.withLock { $0?.finish(); $0 = nil }
+        continuation?.finish()
         _audioLevel.value = 0
+        try? await stream?.stopCapture()
+        // An open in flight stops its own stream once it sees Stop; wait
+        // for it so nothing is capturing after stop() returns.
+        for _ in 0..<250 where _state.withLock({ $0.opening > 0 }) {
+            try? await Task.sleep(for: .milliseconds(20))
+        }
     }
 
     // MARK: - SCStreamOutput
@@ -187,15 +254,35 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
         )
         guard status == noErr else { return }
 
-        // Count the sample and mark the stream live, only if it is still
-        // the current stream.
+        // A replacement's first buffer: work out the gap it left, then
+        // build the silence outside the lock. The queue is serial, so no
+        // later buffer from this stream can go out first.
+        let now = Date()
+        let pendingGap = _state.withLock { state -> TimeInterval? in
+            guard state.stream === stream, state.fillGapOnFirstSample else { return nil }
+            guard let last = state.lastSampleAt else { return 0 }
+            let bufferDuration = Double(frameCount) / format.sampleRate
+            return min(max(now.timeIntervalSince(last) - bufferDuration, 0), Self.maxGapFill)
+        }
+        let silence = (pendingGap ?? 0) > 0.05 ? Self.silence(seconds: pendingGap!, format: format) : []
+
+        // Deliver only if this is still the current stream, into its own
+        // recording, and mark it live only once the gap and the first
+        // buffer are out.
         let counted = _state.withLock { state -> Int? in
-            guard state.stream === stream else { return nil }
+            guard state.stream === stream, let continuation = state.continuation else { return nil }
+            for buffer in silence { continuation.yield(buffer) }
+            continuation.yield(pcmBuffer)
+            state.fillGapOnFirstSample = false
+            state.lastSampleAt = now
             state.sampleCount += 1
             state.hasAudio = true
             return state.sampleCount
         }
         guard let count = counted else { return }
+        if !silence.isEmpty {
+            engineLog("[SYS-RESTART] filled \(String(format: "%.1f", pendingGap ?? 0))s gap with silence")
+        }
 
         // Update audio level for visualizer
         let rms = Self.normalizedRMS(from: pcmBuffer)
@@ -205,27 +292,6 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
         if count <= 5 || count % 200 == 0 {
             engineLog("[SYS-RAW] #\(count) frames=\(frameCount) sr=\(asbd.mSampleRate) ch=\(asbd.mChannelsPerFrame) rms=\(rms)")
         }
-
-        // First sample from a replacement stream: fill the gap with silence
-        // first, so everything after it stays at the right time.
-        let now = Date()
-        let gap = _session.withLock { session -> TimeInterval in
-            defer {
-                session.lastSampleAt = now
-                session.fillGapOnNextSample = false
-            }
-            guard session.fillGapOnNextSample, let last = session.lastSampleAt else { return 0 }
-            let bufferDuration = Double(frameCount) / format.sampleRate
-            return min(max(now.timeIntervalSince(last) - bufferDuration, 0), Self.maxGapFill)
-        }
-        if gap > 0.05 {
-            engineLog("[SYS-RESTART] filling \(String(format: "%.1f", gap))s gap with silence")
-            for silence in Self.silence(seconds: gap, format: format) {
-                _ = _sysContinuation.withLock { $0?.yield(silence) }
-            }
-        }
-
-        _ = _sysContinuation.withLock { $0?.yield(pcmBuffer) }
     }
 
     /// Zeroed buffers, at most one second each, covering `seconds`.
@@ -250,19 +316,21 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
     // MARK: - SCStreamDelegate
 
     nonisolated func stream(_ stream: SCStream, didStopWithError error: any Error) {
-        let wasCurrent = _state.withLock { state -> Bool in
-            guard state.stream === stream else { return false }
-            state = StreamState()
-            return true
+        let generation = _state.withLock { state -> Int? in
+            guard state.stream === stream else { return nil }
+            state.stream = nil
+            state.hasAudio = false
+            state.sampleCount = 0
+            return state.generation
         }
-        guard wasCurrent else {
+        guard let generation else {
             engineLog("[SYS-STOP] an old stream stopped with error (ignored): \(error)")
             return
         }
         engineLog("[SYS-STOP] stream stopped with error: \(error)")
         _audioLevel.value = 0
         // Keep the consumer's stream open: restart() feeds it again.
-        _onStreamStopped.withLock { $0 }?(error)
+        _onStreamStopped.withLock { $0 }?(generation, error)
     }
 
     private static func normalizedRMS(from buffer: AVAudioPCMBuffer) -> Float {
@@ -277,7 +345,4 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
         return sqrt(sum / Float(frameLength))
     }
 
-    enum CaptureError: Error {
-        case noDisplay
-    }
 }
