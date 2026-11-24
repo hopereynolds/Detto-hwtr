@@ -46,7 +46,9 @@ struct DettoApp: App {
         .defaultSize(width: 340, height: 580)
         .commands {
             CommandGroup(after: .appInfo) {
-                CheckForUpdatesView(updater: updaterController.updater)
+                if AppPaths.updatesEnabled {
+                    CheckForUpdatesView(updater: updaterController.updater)
+                }
             }
         }
         Settings {

@@ -401,6 +401,13 @@ struct ContentView: View {
     private var dettoToolbar: some View {
         HStack(spacing: 0) {
             DettoWordmark(size: 18)
+            if let forkLabel = AppPaths.forkLabel {
+                Text(forkLabel)
+                    .font(.dMono(size: 10, weight: .bold))
+                    .tracking(1)
+                    .foregroundStyle(Color.dDim)
+                    .padding(.leading, 8)
+            }
 
             Spacer()
 

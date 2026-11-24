@@ -370,8 +370,7 @@ final class TranscriptionEngine {
 
             // Create temp audio file for post-session batch diarization
             if offlineDiarEngine != nil {
-                let cachesDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
-                    .appendingPathComponent("io.gremble.detto/audio-sessions", isDirectory: true)
+                let cachesDir = AppPaths.audioSessions
                 try? FileManager.default.createDirectory(at: cachesDir, withIntermediateDirectories: true)
                 let audioPath = cachesDir.appendingPathComponent("\(UUID().uuidString).raw")
                 FileManager.default.createFile(atPath: audioPath.path, contents: nil)
@@ -873,8 +872,7 @@ final class TranscriptionEngine {
     }
 
     static func cleanupOrphanedAudioFiles() {
-        let cachesDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
-            .appendingPathComponent("io.gremble.detto/audio-sessions", isDirectory: true)
+        let cachesDir = AppPaths.audioSessions
         guard let files = try? FileManager.default.contentsOfDirectory(at: cachesDir, includingPropertiesForKeys: nil) else { return }
         for file in files {
             try? FileManager.default.removeItem(at: file)

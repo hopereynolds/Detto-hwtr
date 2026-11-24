@@ -16,8 +16,11 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT_DIR="$(pwd)"
 SWIFT_DIR="$ROOT_DIR/Detto"
-APP_NAME="Detto"
-BUNDLE_ID="io.gremble.detto"
+# APP_NAME and BUNDLE_ID can be overridden to build a fork that installs
+# next to Detto instead of replacing it (see build_hwtr.sh).
+APP_NAME="${APP_NAME:-Detto}"
+BUNDLE_ID="${BUNDLE_ID:-io.gremble.detto}"
+DOCUMENTS_FOLDER_NAME="${DOCUMENTS_FOLDER_NAME:-$APP_NAME}"
 
 echo "=== Building $APP_NAME (Swift) ==="
 
@@ -53,6 +56,22 @@ fi
 
 # Copy Info.plist
 cp "$SWIFT_DIR/Sources/Detto/Info.plist" "$APP_DIR/Contents/Info.plist"
+
+# A fork gets its own name and bundle ID, and no update feed: upstream
+# releases are signed for io.gremble.detto and would replace the fork.
+if [[ "$BUNDLE_ID" != "io.gremble.detto" ]]; then
+  PLIST="$APP_DIR/Contents/Info.plist"
+  /usr/libexec/PlistBuddy \
+    -c "Set :CFBundleIdentifier $BUNDLE_ID" \
+    -c "Set :CFBundleName $APP_NAME" \
+    -c "Set :CFBundleDisplayName $APP_NAME" \
+    -c "Add :DettoDocumentsFolderName string $DOCUMENTS_FOLDER_NAME" \
+    -c "Set :SUEnableAutomaticChecks false" \
+    -c "Delete :SUFeedURL" \
+    -c "Delete :SUPublicEDKey" \
+    "$PLIST"
+  echo "Info.plist set for $APP_NAME ($BUNDLE_ID), updates off"
+fi
 
 # Copy app icon
 ICON_PATH="$SWIFT_DIR/Sources/Detto/Assets/AppIcon.icns"
@@ -127,6 +146,17 @@ if [[ -n "${CODESIGN_IDENTITY:-}" ]]; then
   ENTITLEMENTS="$SWIFT_DIR/Sources/Detto/Detto.entitlements"
   echo "Signing with: $CODESIGN_IDENTITY"
 
+  # A self-signed certificate has no Team ID, and the hardened runtime only
+  # loads frameworks (Sparkle) whose Team ID matches the app's. Local builds
+  # signed that way set DISABLE_LIBRARY_VALIDATION=1 (see build_hwtr.sh).
+  if [[ "${DISABLE_LIBRARY_VALIDATION:-0}" == "1" ]]; then
+    LOCAL_ENTITLEMENTS="$(mktemp -d)/local.entitlements"
+    cp "$ENTITLEMENTS" "$LOCAL_ENTITLEMENTS"
+    /usr/libexec/PlistBuddy -c "Add :com.apple.security.cs.disable-library-validation bool true" "$LOCAL_ENTITLEMENTS"
+    ENTITLEMENTS="$LOCAL_ENTITLEMENTS"
+    echo "Library validation off (self-signed local build)"
+  fi
+
   # Sign Sparkle components inside-out (innermost first)
   SPARKLE_FW_BUNDLE="$APP_DIR/Contents/Frameworks/Sparkle.framework"
   if [[ -d "$SPARKLE_FW_BUNDLE" ]]; then
@@ -176,10 +206,43 @@ else
   echo "Set CODESIGN_IDENTITY or install a Developer ID certificate for signed builds."
 fi
 
-# Install to /Applications if writable
+# Install to /Applications if writable. The new bundle is copied and
+# verified next to the installed one first, then swapped in, so a failed
+# copy never leaves you without a working app. An installed app with a
+# different bundle ID is never replaced (e.g. a fork named "Detto").
 if [[ -w /Applications/ ]]; then
-  cp -R "$APP_DIR" /Applications/
-  echo "Installed to /Applications/$APP_NAME.app"
+  DEST="/Applications/$APP_NAME.app"
+  STAGED="/Applications/.$APP_NAME.app.new"
+  PREVIOUS="/Applications/.$APP_NAME.app.old"
+
+  if [[ -d "$DEST" ]]; then
+    INSTALLED_ID=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$DEST/Contents/Info.plist" 2>/dev/null || true)
+    if [[ "$INSTALLED_ID" != "$BUNDLE_ID" ]]; then
+      echo "Not installing: $DEST is ${INSTALLED_ID:-an unknown app}, not $BUNDLE_ID. App is at: $APP_DIR"
+      exit 1
+    fi
+  fi
+
+  rm -rf "$STAGED" "$PREVIOUS"
+  ditto "$APP_DIR" "$STAGED"
+  if [[ -n "${CODESIGN_IDENTITY:-}" ]] && ! codesign --verify --deep --strict "$STAGED"; then
+    rm -rf "$STAGED"
+    echo "Not installing: the copied app failed signature verification. App is at: $APP_DIR"
+    exit 1
+  fi
+
+  if [[ -d "$DEST" ]]; then
+    mv "$DEST" "$PREVIOUS"
+  fi
+  if mv "$STAGED" "$DEST"; then
+    rm -rf "$PREVIOUS"
+    echo "Installed to $DEST"
+  else
+    [[ -d "$PREVIOUS" ]] && mv "$PREVIOUS" "$DEST"
+    rm -rf "$STAGED"
+    echo "Install failed; kept the previous app. New build is at: $APP_DIR"
+    exit 1
+  fi
 else
   echo "Skipped install to /Applications (no write access). App is at: $APP_DIR"
 fi

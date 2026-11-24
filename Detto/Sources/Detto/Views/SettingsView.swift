@@ -137,14 +137,16 @@ struct SettingsView: View {
                 sectionHeader("PRIVACY")
             }
 
-            Section {
-                Toggle("Automatically check for updates", isOn: Binding(
-                    get: { updater.automaticallyChecksForUpdates },
-                    set: { updater.automaticallyChecksForUpdates = $0 }
-                ))
-                .font(.dMono(size: 12, weight: .medium))
-            } header: {
-                sectionHeader("ABOUT")
+            if AppPaths.updatesEnabled {
+                Section {
+                    Toggle("Automatically check for updates", isOn: Binding(
+                        get: { updater.automaticallyChecksForUpdates },
+                        set: { updater.automaticallyChecksForUpdates = $0 }
+                    ))
+                    .font(.dMono(size: 12, weight: .medium))
+                } header: {
+                    sectionHeader("ABOUT")
+                }
             }
         }
         .formStyle(.grouped)

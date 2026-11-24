@@ -91,8 +91,8 @@ final class AppSettings {
         self.transcriptionLocale = defaults.string(forKey: "transcriptionLocale") ?? "en-US"
         self.inputDeviceID = AudioDeviceID(defaults.integer(forKey: "inputDeviceID"))
         self.preferBuiltInMicDuringCalls = defaults.object(forKey: "preferBuiltInMicDuringCalls") as? Bool ?? true
-        self.vaultMeetingsPath = defaults.string(forKey: "vaultMeetingsPath") ?? NSString("~/Documents/Detto/Meetings").expandingTildeInPath
-        self.vaultVoicePath = defaults.string(forKey: "vaultVoicePath") ?? NSString("~/Documents/Detto/Voice").expandingTildeInPath
+        self.vaultMeetingsPath = defaults.string(forKey: "vaultMeetingsPath") ?? AppPaths.defaultDocumentsFolder + "/Meetings"
+        self.vaultVoicePath = defaults.string(forKey: "vaultVoicePath") ?? AppPaths.defaultDocumentsFolder + "/Voice"
         self.vaultRootPath = defaults.string(forKey: "vaultRootPath") ?? ""
         self.vaultMeetingsBookmark = defaults.data(forKey: "vaultMeetingsBookmark")
         self.vaultVoiceBookmark = defaults.data(forKey: "vaultVoiceBookmark")

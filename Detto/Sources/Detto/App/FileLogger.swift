@@ -10,13 +10,12 @@ final class FileLogger: Sendable {
 
     private init(maxRuns: Int = 5) {
         self.maxRuns = maxRuns
-        let logsDir = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Logs/Detto")
+        let logsDir = AppPaths.logs
         self.directory = logsDir
         self.currentLogURL = logsDir.appendingPathComponent("detto.log")
         try? FileManager.default.createDirectory(at: logsDir, withIntermediateDirectories: true)
         rotateIfNeeded()
-        writeRaw("--- Detto launched at \(ISO8601DateFormatter().string(from: Date())) ---\n")
+        writeRaw("--- \(AppPaths.displayName) launched at \(ISO8601DateFormatter().string(from: Date())) ---\n")
     }
 
     func log(_ message: String, category: String = "general") {

@@ -21,6 +21,24 @@ actor TranscriptLogger {
         values.isEmpty ? "[]" : "[" + values.map(yamlScalar).joined(separator: ", ") + "]"
     }
 
+    /// A temp name no other write (or another copy of the app saving to the
+    /// same folder) is using at the same moment.
+    private static func tempFilename() -> String {
+        ".detto_tmp-\(UUID().uuidString).md"
+    }
+
+    /// `name.md`, or `name (2).md` etc. if that file already exists, so a
+    /// new recording never overwrites an existing note.
+    private static func availableFileURL(in directory: URL, baseName: String) -> URL {
+        var candidate = directory.appendingPathComponent("\(baseName).md")
+        var n = 2
+        while FileManager.default.fileExists(atPath: candidate.path) {
+            candidate = directory.appendingPathComponent("\(baseName) (\(n)).md")
+            n += 1
+        }
+        return candidate
+    }
+
     private var fileHandle: FileHandle?
     private var currentFilePath: URL?
     private var sessionStartTime: Date?
@@ -64,8 +82,9 @@ actor TranscriptLogger {
         let logTag = isVoiceMemo ? "log/voice" : "log/meeting"
         let sourceTag = isVoiceMemo ? "source/voice" : "source/meeting"
 
-        let filename = "\(fileFmt.string(from: now)) \(fileLabel).md"
-        currentFilePath = directory.appendingPathComponent(filename)
+        let fileURL = Self.availableFileURL(in: directory, baseName: "\(fileFmt.string(from: now)) \(fileLabel)")
+        let filename = fileURL.lastPathComponent
+        currentFilePath = fileURL
 
         let shortContext = sessionContext.trimmingCharacters(in: .whitespacesAndNewlines)
 
@@ -196,7 +215,7 @@ tags:
             content.insert(contentsOf: "\n### Notes\n\(text)\n", at: contextEnd.lowerBound)
         }
 
-        let tmpPath = filePath.deletingLastPathComponent().appendingPathComponent(".detto_tmp.md")
+        let tmpPath = filePath.deletingLastPathComponent().appendingPathComponent(Self.tempFilename())
         do {
             try content.write(to: tmpPath, atomically: true, encoding: .utf8)
             _ = try FileManager.default.replaceItemAt(filePath, withItemAt: tmpPath)
@@ -239,7 +258,7 @@ tags:
             content.insert(contentsOf: "\n\(attendeesLine)\n", at: contextStart.upperBound)
         }
 
-        let tmpPath = filePath.deletingLastPathComponent().appendingPathComponent(".detto_tmp.md")
+        let tmpPath = filePath.deletingLastPathComponent().appendingPathComponent(Self.tempFilename())
         do {
             try content.write(to: tmpPath, atomically: true, encoding: .utf8)
             _ = try FileManager.default.replaceItemAt(filePath, withItemAt: tmpPath)
@@ -273,7 +292,7 @@ tags:
 
         content.replaceSubrange(transcriptStart.upperBound..<content.endIndex, with: body)
 
-        let tmpPath = filePath.deletingLastPathComponent().appendingPathComponent(".detto_rewrite_tmp.md")
+        let tmpPath = filePath.deletingLastPathComponent().appendingPathComponent(Self.tempFilename())
         do {
             try content.write(to: tmpPath, atomically: true, encoding: .utf8)
             _ = try FileManager.default.replaceItemAt(filePath, withItemAt: tmpPath)
@@ -385,7 +404,7 @@ tags:
             finalPath = newPath
         }
 
-        let tmpPath = filePath.deletingLastPathComponent().appendingPathComponent(".detto_tmp.md")
+        let tmpPath = filePath.deletingLastPathComponent().appendingPathComponent(Self.tempFilename())
         do {
             try content.write(to: tmpPath, atomically: true, encoding: .utf8)
             if finalPath != filePath {

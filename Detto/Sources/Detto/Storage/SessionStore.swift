@@ -7,8 +7,7 @@ actor SessionStore {
     private let encoder = JSONEncoder()
 
     init() {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        sessionsDirectory = appSupport.appendingPathComponent("Detto/sessions", isDirectory: true)
+        sessionsDirectory = AppPaths.applicationSupport.appendingPathComponent("sessions", isDirectory: true)
 
         try? FileManager.default.createDirectory(at: sessionsDirectory, withIntermediateDirectories: true)
 
