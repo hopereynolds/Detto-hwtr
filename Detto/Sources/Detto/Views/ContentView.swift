@@ -86,16 +86,23 @@ struct ContentView: View {
             }
         }
         .task {
-            let recovered = await LaunchRecovery.runOnce()
-            if let last = recovered.last, savedFileURL == nil, activeSessionType == nil, !isStarting, !isSaving {
-                savedFileWasRecovered = true
-                savedFileURL = last
-            }
             if !hasCompletedOnboarding {
                 showOnboarding = true
             }
+            // Before anything awaits, so Start always finds a recorder.
             if transcriptionEngine == nil {
                 transcriptionEngine = TranscriptionEngine(transcriptStore: transcriptStore, modelManager: asrManager)
+            }
+            let recovery = await LaunchRecovery.runOnce()
+            let idle = activeSessionType == nil && !isStarting && !isSaving
+            if let last = recovery.recovered.last, savedFileURL == nil, idle {
+                savedFileWasRecovered = true
+                savedFileURL = last
+            }
+            if recovery.failed > 0, idle, transcriptionEngine?.lastError == nil {
+                transcriptionEngine?.lastError = recovery.failed == 1
+                    ? "A note from an earlier recording couldn't be finished. \(AppPaths.displayName) will try again next time it opens."
+                    : "\(recovery.failed) notes from earlier recordings couldn't be finished. \(AppPaths.displayName) will try again next time it opens."
             }
             dictationController.isMeetingActive = { [weak transcriptionEngine] in
                 transcriptionEngine?.isRunning ?? false
@@ -717,7 +724,11 @@ struct ContentView: View {
                 preferBuiltInMic: settings.preferBuiltInMicDuringCalls,
                 vocabularyCorrector: corrector
             ) ?? false
-            if !started { await abandonFailedStart() }
+            if started {
+                await transcriptLogger.attachAudio(transcriptionEngine?.sessionAudioPath)
+            } else {
+                await abandonFailedStart()
+            }
         }
     }
 
@@ -822,7 +833,11 @@ struct ContentView: View {
                     vocabularyCorrector: corrector
                 ) ?? false
             }
-            if !started { await abandonFailedStart() }
+            if started {
+                await transcriptLogger.attachAudio(transcriptionEngine?.sessionAudioPath)
+            } else {
+                await abandonFailedStart()
+            }
         }
     }
 
@@ -872,8 +887,14 @@ struct ContentView: View {
 
             transcriptionEngine?.assetStatus = "Finalizing..."
             let savedPath = await transcriptLogger.finalizeFrontmatter()
-            // The note is saved; its temp audio isn't needed any more.
-            transcriptionEngine?.discardSessionAudio()
+            if savedPath != nil {
+                // The note is saved; its temp audio isn't needed any more.
+                transcriptionEngine?.discardSessionAudio()
+            } else {
+                // Keep the audio and the recovery record; say so.
+                transcriptionEngine?.keepSessionAudioForRecovery()
+                transcriptionEngine?.lastError = "Couldn't finish saving the note. What was transcribed during the call is in it, and \(AppPaths.displayName) will try to finish it next time it opens."
+            }
             transcriptionEngine?.assetStatus = "Ready"
 
             transcriptStore.clear()
@@ -981,11 +1002,14 @@ enum LaunchRecovery {
     static let launchedAt = Date()
     private static var ran = false
 
-    static func runOnce() async -> [URL] {
-        guard !ran else { return [] }
+    static func runOnce() async -> TranscriptLogger.RecoveryResult {
+        guard !ran else { return TranscriptLogger.RecoveryResult() }
         ran = true
-        let recovered = await TranscriptLogger.recoverInterruptedRecordings(startedBefore: launchedAt)
-        TranscriptionEngine.cleanupOrphanedAudioFiles(createdBefore: launchedAt)
-        return recovered
+        let result = await TranscriptLogger.recoverInterruptedRecordings(startedBefore: launchedAt)
+        TranscriptionEngine.cleanupOrphanedAudioFiles(
+            createdBefore: launchedAt,
+            keeping: TranscriptLogger.audioPathsInProgress()
+        )
+        return result
     }
 }

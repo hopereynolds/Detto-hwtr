@@ -51,83 +51,178 @@ actor TranscriptLogger {
     // MARK: - Recordings in progress
 
     /// What's needed to finish a note if the app quits before saving it.
-    /// Written when the note is created, removed once it's saved.
+    /// Written when the note is created, removed once it's saved. The file
+    /// is named after the recording's ID, which is also in the note's
+    /// frontmatter (`detto_recording`), so a retry can tell its own renamed
+    /// note from someone else's.
     struct InProgressRecord: Codable {
         var notePath: String
         var startedAt: Date
         var context: String
+        /// The recording's temp audio; kept until the note is saved.
+        var audioPath: String?
+        /// Where a save was about to publish the renamed note.
+        var pendingPath: String?
+    }
+
+    private struct Journal {
+        let url: URL
+        var record: InProgressRecord
+        var recordingID: String { url.deletingPathExtension().lastPathComponent }
     }
 
     private let journalDirectory: URL
-    private var currentJournalFile: URL?
-    private var lastJournalFile: URL?
+    private var currentJournal: Journal?
+    private var lastJournal: Journal?
 
     init(journalDirectory: URL = AppPaths.recordingsInProgress) {
         self.journalDirectory = journalDirectory
     }
 
-    private func writeJournal(_ record: InProgressRecord, to url: URL) {
+    @discardableResult
+    private static func writeJournal(_ record: InProgressRecord, to url: URL) -> Bool {
         do {
-            try FileManager.default.createDirectory(at: journalDirectory, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
             try JSONEncoder().encode(record).write(to: url, options: .atomic)
+            return true
         } catch {
             engineLog("[LOGGER] couldn't record the recording in progress: \(error.localizedDescription)")
+            return false
         }
     }
 
-    private static func removeJournal(_ url: URL?) {
-        guard let url else { return }
-        try? FileManager.default.removeItem(at: url)
+    /// The note is saved: drop its record and its temp audio.
+    private static func finishJournal(_ journal: Journal) {
+        if let audio = journal.record.audioPath {
+            try? FileManager.default.removeItem(atPath: audio)
+        }
+        try? FileManager.default.removeItem(at: journal.url)
     }
 
-    /// Finishes notes whose recording ended without a save (the app quit or
-    /// crashed): sets the duration from the last write and the speakers from
-    /// the transcript, adds a line saying it was recovered, and renames it
-    /// like a normal save. The transcript is what was written live; speaker
-    /// labels aren't refined. Returns the notes it finished, oldest first.
-    @discardableResult
-    static func recoverInterruptedRecordings(startedBefore cutoff: Date, journalDirectory: URL = AppPaths.recordingsInProgress) async -> [URL] {
-        guard let files = try? FileManager.default.contentsOfDirectory(at: journalDirectory, includingPropertiesForKeys: nil) else { return [] }
+    private static func recordingLine(_ id: String) -> String {
+        "detto_recording: \"\(id)\""
+    }
+
+    /// The renamed note an interrupted save already published, if the
+    /// file at `pendingPath` really is this recording's.
+    private static func publishedNote(of journal: Journal) -> URL? {
+        guard let pending = journal.record.pendingPath,
+              let content = try? String(contentsOfFile: pending, encoding: .utf8),
+              content.contains(recordingLine(journal.recordingID)) else { return nil }
+        return URL(fileURLWithPath: pending)
+    }
+
+    /// Before a save publishes the renamed note, note where it's going, so
+    /// a retry after a crash recognizes it instead of saving a second copy.
+    private static func pendingWriter(for journal: Journal) -> @Sendable (URL) -> Bool {
+        let url = journal.url
+        let record = journal.record
+        return { pending in
+            var updated = record
+            updated.pendingPath = pending.path
+            return writeJournal(updated, to: url)
+        }
+    }
+
+    /// Tie the recording's temp audio to its record, so it's kept until the
+    /// note is saved (or recovered).
+    func attachAudio(_ path: URL?) {
+        guard let path, var journal = currentJournal else { return }
+        journal.record.audioPath = path.path
+        Self.writeJournal(journal.record, to: journal.url)
+        currentJournal = journal
+    }
+
+    struct RecoveryResult {
+        /// Notes finished, oldest first.
+        var recovered: [URL] = []
+        /// Notes that still couldn't be saved; tried again next launch.
+        var failed = 0
+    }
+
+    /// Finishes notes whose recording ended without a save (the app quit,
+    /// crashed, or the save failed): sets the duration from the last write
+    /// and the speakers from the transcript, adds a line saying it was
+    /// recovered, and renames it like a normal save. The transcript is
+    /// what was written live; speaker labels aren't refined. A record is
+    /// removed (with its audio) only once its note is saved, or if the note
+    /// no longer exists at all.
+    static func recoverInterruptedRecordings(startedBefore cutoff: Date, journalDirectory: URL = AppPaths.recordingsInProgress) async -> RecoveryResult {
+        var result = RecoveryResult()
+        guard let files = try? FileManager.default.contentsOfDirectory(at: journalDirectory, includingPropertiesForKeys: nil) else { return result }
         var recovered: [(Date, URL)] = []
         for file in files where file.pathExtension == "json" {
             guard let data = try? Data(contentsOf: file),
                   let record = try? JSONDecoder().decode(InProgressRecord.self, from: data) else {
-                engineLog("[RECOVER] unreadable record \(file.lastPathComponent), removing it")
-                removeJournal(file)
+                // Can't be retried; set it aside rather than nag every launch.
+                engineLog("[RECOVER] unreadable record \(file.lastPathComponent); set aside as .bad")
+                try? FileManager.default.moveItem(at: file, to: file.appendingPathExtension("bad"))
                 continue
             }
             // A recording from this run is still going.
             guard record.startedAt < cutoff else { continue }
+            let journal = Journal(url: file, record: record)
             let note = URL(fileURLWithPath: record.notePath)
-            guard FileManager.default.fileExists(atPath: note.path),
-                  let content = try? String(contentsOf: note, encoding: .utf8) else {
+
+            // An interrupted save already published the renamed note:
+            // finish its cleanup instead of saving a second copy.
+            if let published = publishedNote(of: journal) {
+                if published.path != note.path {
+                    try? FileManager.default.removeItem(at: note)
+                }
+                engineLog("[RECOVER] note was already saved as \(published.lastPathComponent); cleaning up")
+                finishJournal(journal)
+                recovered.append((record.startedAt, published))
+                continue
+            }
+            guard FileManager.default.fileExists(atPath: note.path) else {
                 engineLog("[RECOVER] note is gone: \(note.lastPathComponent)")
-                removeJournal(file)
+                finishJournal(journal)
+                continue
+            }
+            guard let content = try? String(contentsOf: note, encoding: .utf8) else {
+                engineLog("[RECOVER] can't read \(note.lastPathComponent); will retry next launch")
+                result.failed += 1
                 continue
             }
             let lastWrite = (try? FileManager.default.attributesOfItem(atPath: note.path)[.modificationDate] as? Date) ?? record.startedAt
-            let speakers = speakerNames(inTranscriptOf: content)
             let saved = await rewriteFrontmatter(
                 filePath: note,
                 startTime: record.startedAt,
                 endTime: max(lastWrite, record.startedAt),
-                speakers: speakers,
+                speakers: speakerNames(inTranscriptOf: content),
                 context: record.context,
-                notice: recoveredNotice
+                notice: recoveredNotice,
+                willPublish: pendingWriter(for: journal)
             )
             if let saved {
                 engineLog("[RECOVER] finished an interrupted note: \(saved.lastPathComponent)")
                 recovered.append((record.startedAt, saved))
-                removeJournal(file)
+                finishJournal(journal)
             } else {
-                // Keep the record so the next launch tries again.
-                engineLog("[RECOVER] couldn't update \(note.lastPathComponent); will retry next launch")
+                engineLog("[RECOVER] couldn't save \(note.lastPathComponent); will retry next launch")
+                result.failed += 1
             }
         }
-        return recovered.sorted { $0.0 < $1.0 }.map(\.1)
+        result.recovered = recovered.sorted { $0.0 < $1.0 }.map(\.1)
+        return result
     }
 
-    static var recoveredNotice: String { "> [!warning] Recovered\n> \(AppPaths.displayName) stopped before this recording was saved. This is the transcript written during the call; speaker names weren't refined and the duration ends at the last line written." }
+    /// Temp audio that unsaved notes still need; launch cleanup keeps it.
+    static func audioPathsInProgress(journalDirectory: URL = AppPaths.recordingsInProgress) -> Set<String> {
+        guard let files = try? FileManager.default.contentsOfDirectory(at: journalDirectory, includingPropertiesForKeys: nil) else { return [] }
+        var paths: Set<String> = []
+        for file in files where file.pathExtension == "json" {
+            if let data = try? Data(contentsOf: file),
+               let record = try? JSONDecoder().decode(InProgressRecord.self, from: data),
+               let audio = record.audioPath {
+                paths.insert(audio)
+            }
+        }
+        return paths
+    }
+
+    static var recoveredNotice: String { "> [!warning] Recovered\n> This note wasn't finished when the recording ended (\(AppPaths.displayName) quit or couldn't save it). This is the transcript written during the call; speaker names weren't refined and the duration ends at the last line written." }
 
     /// Speaker names from the transcript's "**Name** (HH:mm:ss)" lines.
     static func speakerNames(inTranscriptOf content: String) -> Set<String> {
@@ -186,6 +281,7 @@ actor TranscriptLogger {
         let logTag = isVoiceMemo ? "log/voice" : "log/meeting"
         let sourceTag = isVoiceMemo ? "source/voice" : "source/meeting"
 
+        let recordingID = UUID().uuidString
         let (fileURL, newFileHandle) = try Self.createNewFile(in: directory, baseName: "\(fileFmt.string(from: now)) \(fileLabel)")
         let filename = fileURL.lastPathComponent
         currentFilePath = fileURL
@@ -231,6 +327,7 @@ created: "\(dateStr)"
 time: "\(timeStr)"
 duration: "00:00"
 detto_version: "\(dettoVersion)"
+\(Self.recordingLine(recordingID))
 source_app: \(Self.yamlScalar(sourceApp))
 source_file: \(Self.yamlScalar(filename))
 attendees: \(attendeesYaml)
@@ -268,9 +365,12 @@ tags:
         }
         fileHandle = newFileHandle
 
-        let journal = journalDirectory.appendingPathComponent("\(UUID().uuidString).json")
-        writeJournal(InProgressRecord(notePath: fileURL.path, startedAt: now, context: sessionContext), to: journal)
-        currentJournalFile = journal
+        let journal = Journal(
+            url: journalDirectory.appendingPathComponent("\(recordingID).json"),
+            record: InProgressRecord(notePath: fileURL.path, startedAt: now, context: sessionContext)
+        )
+        Self.writeJournal(journal.record, to: journal.url)
+        currentJournal = journal
     }
 
     func append(speaker: String, text: String, timestamp: Date) {
@@ -428,8 +528,8 @@ tags:
             try? FileManager.default.removeItem(at: currentFilePath)
             engineLog("[LOGGER] discarded the note of a recording that didn't start: \(currentFilePath.lastPathComponent)")
         }
-        Self.removeJournal(currentJournalFile)
-        currentJournalFile = nil
+        if let currentJournal { Self.finishJournal(currentJournal) }
+        currentJournal = nil
         currentFilePath = nil
         sessionStartTime = nil
         speakersDetected = []
@@ -450,8 +550,8 @@ tags:
         lastSessionStartTime = sessionStartTime
         lastSpeakersDetected = speakersDetected
         lastSessionContext = sessionContext
-        lastJournalFile = currentJournalFile
-        currentJournalFile = nil
+        lastJournal = currentJournal
+        currentJournal = nil
 
         // Reset state immediately so next session can start
         currentFilePath = nil
@@ -474,16 +574,17 @@ tags:
             startTime: startTime,
             endTime: Date(),
             speakers: lastSpeakersDetected,
-            context: lastSessionContext
+            context: lastSessionContext,
+            willPublish: lastJournal.map(Self.pendingWriter(for:))
         )
 
         let savedPath = lastSessionFilePath
-        // Saved: nothing left to recover. If the update failed, keep the
-        // record so the next launch finishes the note.
-        if savedPath != nil {
-            Self.removeJournal(lastJournalFile)
+        // Saved: nothing left to recover, and the audio can go. If the
+        // write failed, keep both so the next launch finishes the note.
+        if savedPath != nil, let lastJournal {
+            Self.finishJournal(lastJournal)
         }
-        lastJournalFile = nil
+        lastJournal = nil
         lastSessionStartTime = nil
         lastSpeakersDetected = []
         lastSessionContext = ""
@@ -496,7 +597,8 @@ tags:
         endTime: Date,
         speakers: Set<String>,
         context: String,
-        notice: String? = nil
+        notice: String? = nil,
+        willPublish: (@Sendable (URL) -> Bool)? = nil
     ) async -> URL? {
         guard var content = try? String(contentsOf: filePath, encoding: .utf8) else { return nil }
 
@@ -554,8 +656,18 @@ tags:
                 } catch {
                     break
                 }
+                // Say where it's going first, so a crash between publishing
+                // and removing the original can't produce a second copy.
+                if let willPublish, !willPublish(newPath) {
+                    try? FileManager.default.removeItem(at: tmpPath)
+                    break
+                }
                 if renamex_np(tmpPath.path, newPath.path, UInt32(RENAME_EXCL)) == 0 {
-                    try? FileManager.default.removeItem(at: filePath)
+                    do {
+                        try FileManager.default.removeItem(at: filePath)
+                    } catch {
+                        engineLog("[LOGGER] saved \(newFilename) but couldn't remove the original: \(error.localizedDescription)")
+                    }
                     return newPath
                 }
                 let renameError = errno
@@ -564,13 +676,16 @@ tags:
             }
         }
 
-        // No rename (or it failed): update the note where it is.
+        // No rename (or it failed): update the note where it is. A failed
+        // write is a failed save: nil, so the caller keeps its record.
         let tmpPath = directory.appendingPathComponent(Self.tempFilename())
         do {
             try content.write(to: tmpPath, atomically: true, encoding: .utf8)
             _ = try FileManager.default.replaceItemAt(filePath, withItemAt: tmpPath)
         } catch {
             try? FileManager.default.removeItem(at: tmpPath)
+            engineLog("[LOGGER] couldn't save \(filePath.lastPathComponent): \(error.localizedDescription)")
+            return nil
         }
         return filePath
     }

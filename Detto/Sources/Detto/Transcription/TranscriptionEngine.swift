@@ -1119,6 +1119,16 @@ final class TranscriptionEngine {
         return 0
     }
 
+    /// The current recording's temp audio, if it has one.
+    var sessionAudioPath: URL? { sysAudioFilePath }
+
+    /// The note couldn't be saved: let go of the audio without deleting
+    /// it. Its recovery record keeps it until the note is recovered.
+    func keepSessionAudioForRecovery() {
+        sysAudioFilePath = nil
+        sessionStartTime = nil
+    }
+
     /// Deletes the recording's temp audio. Call after its note is saved.
     func discardSessionAudio() {
         if let path = sysAudioFilePath {
@@ -1130,13 +1140,15 @@ final class TranscriptionEngine {
 
     /// Deletes temp audio left by recordings that ended without a save.
     /// Only files created before `cutoff` (this launch), so a recording
-    /// started meanwhile keeps its audio.
-    static func cleanupOrphanedAudioFiles(createdBefore cutoff: Date) {
+    /// started meanwhile keeps its audio, and never audio an unsaved
+    /// note's recovery record still holds.
+    static func cleanupOrphanedAudioFiles(createdBefore cutoff: Date, keeping inUse: Set<String>) {
         let cachesDir = AppPaths.audioSessions
         guard let files = try? FileManager.default.contentsOfDirectory(at: cachesDir, includingPropertiesForKeys: [.creationDateKey]) else { return }
+        let keptNames = Set(inUse.map { URL(fileURLWithPath: $0).lastPathComponent })
         for file in files {
             let created = (try? file.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast
-            guard created < cutoff else { continue }
+            guard created < cutoff, !keptNames.contains(file.lastPathComponent) else { continue }
             try? FileManager.default.removeItem(at: file)
         }
     }

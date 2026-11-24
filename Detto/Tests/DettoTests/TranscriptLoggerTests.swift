@@ -103,7 +103,7 @@ final class TranscriptLoggerTests: XCTestCase {
         await logger.append(speaker: "Speaker 1", text: "second line", timestamp: Date())
         // No endSession or finalize: the app "crashed" here.
 
-        let recovered = await TranscriptLogger.recoverInterruptedRecordings(startedBefore: Date().addingTimeInterval(1), journalDirectory: journal)
+        let recovered = await TranscriptLogger.recoverInterruptedRecordings(startedBefore: Date().addingTimeInterval(1), journalDirectory: journal).recovered
         let note = try XCTUnwrap(recovered.first)
         XCTAssertEqual(recovered.count, 1)
         XCTAssertTrue(note.lastPathComponent.hasSuffix("Design sync.md"), note.lastPathComponent)
@@ -119,7 +119,8 @@ final class TranscriptLoggerTests: XCTestCase {
 
         // Running it again finds nothing.
         let again = await TranscriptLogger.recoverInterruptedRecordings(startedBefore: Date().addingTimeInterval(1), journalDirectory: journal)
-        XCTAssertEqual(again, [])
+        XCTAssertEqual(again.recovered, [])
+        XCTAssertEqual(again.failed, 0)
     }
 
     /// A recording started during this launch is never touched.
@@ -128,7 +129,7 @@ final class TranscriptLoggerTests: XCTestCase {
         let logger = makeLogger()
         try await logger.startSession(sourceApp: "Call", vaultPath: directory.path)
         await logger.append(speaker: "You", text: "still talking", timestamp: Date())
-        let recovered = await TranscriptLogger.recoverInterruptedRecordings(startedBefore: cutoff, journalDirectory: journal)
+        let recovered = await TranscriptLogger.recoverInterruptedRecordings(startedBefore: cutoff, journalDirectory: journal).recovered
         XCTAssertEqual(recovered, [])
         XCTAssertEqual(journalEntries().count, 1)
         let content = try String(contentsOf: directory.appendingPathComponent(try XCTUnwrap(notes().first)), encoding: .utf8)
@@ -145,5 +146,98 @@ final class TranscriptLoggerTests: XCTestCase {
         let finalized = await logger.finalizeFrontmatter()
         let saved = try XCTUnwrap(finalized)
         XCTAssertTrue(try String(contentsOf: saved, encoding: .utf8).contains("keep me"))
+    }
+
+    private func makeAudioFile() throws -> URL {
+        let audio = directory.appendingPathComponent("\(UUID().uuidString).raw")
+        try Data([1, 2, 3]).write(to: audio)
+        return audio
+    }
+
+    /// The audio is deleted with the record once the note saves.
+    func testSavedNoteReleasesItsAudio() async throws {
+        let logger = makeLogger()
+        let audio = try makeAudioFile()
+        try await logger.startSession(sourceApp: "Call", vaultPath: directory.path)
+        await logger.attachAudio(audio)
+        XCTAssertEqual(TranscriptLogger.audioPathsInProgress(journalDirectory: journal), [audio.path])
+        await logger.endSession()
+        let saved = await logger.finalizeFrontmatter()
+        XCTAssertNotNil(saved)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: audio.path))
+        XCTAssertEqual(journalEntries(), [])
+    }
+
+    /// A save that can't write reports failure and keeps the record and
+    /// the audio; recovery finishes it once the folder is writable again.
+    func testFailedSaveKeepsRecordAndAudio() async throws {
+        let notesDir = directory.appendingPathComponent("notes", isDirectory: true)
+        let logger = makeLogger()
+        let audio = try makeAudioFile()
+        try await logger.startSession(sourceApp: "Call", vaultPath: notesDir.path, context: "Design sync")
+        await logger.attachAudio(audio)
+        await logger.append(speaker: "You", text: "hello", timestamp: Date())
+        await logger.endSession()
+
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: notesDir.path)
+        let saved = await logger.finalizeFrontmatter()
+        let stillLocked = await TranscriptLogger.recoverInterruptedRecordings(startedBefore: Date().addingTimeInterval(1), journalDirectory: journal)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: notesDir.path)
+
+        XCTAssertNil(saved, "a failed write must not report success")
+        XCTAssertEqual(stillLocked.failed, 1)
+        XCTAssertEqual(journalEntries().count, 1)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: audio.path))
+
+        let retry = await TranscriptLogger.recoverInterruptedRecordings(startedBefore: Date().addingTimeInterval(1), journalDirectory: journal)
+        XCTAssertEqual(retry.recovered.count, 1)
+        XCTAssertEqual(retry.failed, 0)
+        XCTAssertEqual(journalEntries(), [])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: audio.path))
+    }
+
+    /// A crash after the renamed note was published but before the original
+    /// was removed: the retry finishes cleanup instead of saving a copy.
+    func testInterruptedRenameDoesNotDuplicateTheNote() async throws {
+        let logger = makeLogger()
+        try await logger.startSession(sourceApp: "Call", vaultPath: directory.path, context: "Design sync")
+        await logger.append(speaker: "You", text: "hello", timestamp: Date())
+        await logger.endSession()
+
+        // Simulate the save getting as far as publishing the renamed note.
+        let entry = try XCTUnwrap(journalEntries().first)
+        let journalFile = journal.appendingPathComponent(entry)
+        var record = try JSONDecoder().decode(TranscriptLogger.InProgressRecord.self, from: Data(contentsOf: journalFile))
+        let original = URL(fileURLWithPath: record.notePath)
+        let published = directory.appendingPathComponent("2026-01-01 00-00-00 Design sync.md")
+        try FileManager.default.copyItem(at: original, to: published)
+        record.pendingPath = published.path
+        try JSONEncoder().encode(record).write(to: journalFile)
+
+        let result = await TranscriptLogger.recoverInterruptedRecordings(startedBefore: Date().addingTimeInterval(1), journalDirectory: journal)
+        XCTAssertEqual(result.recovered, [published])
+        XCTAssertEqual(try notes(), [published.lastPathComponent])
+        XCTAssertEqual(journalEntries(), [])
+    }
+
+    /// A pending name that holds someone else's note isn't mistaken for ours.
+    func testPendingPathWithAnotherNoteIsIgnored() async throws {
+        let logger = makeLogger()
+        try await logger.startSession(sourceApp: "Call", vaultPath: directory.path)
+        await logger.append(speaker: "You", text: "mine", timestamp: Date())
+        await logger.endSession()
+        let entry = try XCTUnwrap(journalEntries().first)
+        let journalFile = journal.appendingPathComponent(entry)
+        var record = try JSONDecoder().decode(TranscriptLogger.InProgressRecord.self, from: Data(contentsOf: journalFile))
+        let other = directory.appendingPathComponent("Someone else.md")
+        try "another note".write(to: other, atomically: true, encoding: .utf8)
+        record.pendingPath = other.path
+        try JSONEncoder().encode(record).write(to: journalFile)
+
+        let result = await TranscriptLogger.recoverInterruptedRecordings(startedBefore: Date().addingTimeInterval(1), journalDirectory: journal)
+        XCTAssertEqual(result.recovered.count, 1)
+        XCTAssertNotEqual(result.recovered.first, other)
+        XCTAssertEqual(try String(contentsOf: other, encoding: .utf8), "another note")
+        XCTAssertTrue(try String(contentsOf: try XCTUnwrap(result.recovered.first), encoding: .utf8).contains("mine"))
     }
 }
