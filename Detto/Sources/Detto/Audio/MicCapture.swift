@@ -109,11 +109,31 @@ final class MicCapture: @unchecked Sendable {
     }
 
     func stop() {
-        engine.inputNode.removeTap(onBus: 0)
-        engine.stop()
+        let stopped = engine
+        stopped.inputNode.removeTap(onBus: 0)
+        stopped.stop()
         engine = AVAudioEngine()
+        Self.retire(stopped)
         _audioLevel.value = 0
         _tapActive.value = false
+    }
+
+    /// How long a stopped engine is kept alive before it's released.
+    private static let retiredEngineLifetime: DispatchTimeInterval = .seconds(10)
+
+    /// Keeps a stopped engine alive for a while instead of releasing it
+    /// right away.
+    ///
+    /// CoreAudio can already have a "device changed" notification queued for
+    /// the engine's input unit when we stop it (Stop, or a mic switch, often
+    /// lands mid device-change storm). If the engine is freed first, that
+    /// notification messages a dead object and the app crashes
+    /// (EXC_BAD_ACCESS in AVAudioIOUnit::IOUnitPropertyListener).
+    private static func retire(_ engine: AVAudioEngine) {
+        let retired = RetiredEngine(engine)
+        DispatchQueue.main.asyncAfter(deadline: .now() + retiredEngineLifetime) {
+            retired.release()
+        }
     }
 
     private static func normalizedRMS(from buffer: AVAudioPCMBuffer) -> Float {
@@ -308,6 +328,13 @@ final class MicCapture: @unchecked Sendable {
         )
         return status == noErr ? deviceID : nil
     }
+}
+
+/// Holds a stopped engine until `release()` is called.
+private final class RetiredEngine: @unchecked Sendable {
+    private var engine: AVAudioEngine?
+    init(_ engine: AVAudioEngine) { self.engine = engine }
+    func release() { engine = nil }
 }
 
 // Thread-safe audio level
