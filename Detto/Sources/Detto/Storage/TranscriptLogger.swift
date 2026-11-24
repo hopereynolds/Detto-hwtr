@@ -48,6 +48,101 @@ actor TranscriptLogger {
         throw TranscriptLoggerError.cannotCreateFile(directory.appendingPathComponent("\(baseName).md").path)
     }
 
+    // MARK: - Recordings in progress
+
+    /// What's needed to finish a note if the app quits before saving it.
+    /// Written when the note is created, removed once it's saved.
+    struct InProgressRecord: Codable {
+        var notePath: String
+        var startedAt: Date
+        var context: String
+    }
+
+    private let journalDirectory: URL
+    private var currentJournalFile: URL?
+    private var lastJournalFile: URL?
+
+    init(journalDirectory: URL = AppPaths.recordingsInProgress) {
+        self.journalDirectory = journalDirectory
+    }
+
+    private func writeJournal(_ record: InProgressRecord, to url: URL) {
+        do {
+            try FileManager.default.createDirectory(at: journalDirectory, withIntermediateDirectories: true)
+            try JSONEncoder().encode(record).write(to: url, options: .atomic)
+        } catch {
+            engineLog("[LOGGER] couldn't record the recording in progress: \(error.localizedDescription)")
+        }
+    }
+
+    private static func removeJournal(_ url: URL?) {
+        guard let url else { return }
+        try? FileManager.default.removeItem(at: url)
+    }
+
+    /// Finishes notes whose recording ended without a save (the app quit or
+    /// crashed): sets the duration from the last write and the speakers from
+    /// the transcript, adds a line saying it was recovered, and renames it
+    /// like a normal save. The transcript is what was written live; speaker
+    /// labels aren't refined. Returns the notes it finished, oldest first.
+    @discardableResult
+    static func recoverInterruptedRecordings(startedBefore cutoff: Date, journalDirectory: URL = AppPaths.recordingsInProgress) async -> [URL] {
+        guard let files = try? FileManager.default.contentsOfDirectory(at: journalDirectory, includingPropertiesForKeys: nil) else { return [] }
+        var recovered: [(Date, URL)] = []
+        for file in files where file.pathExtension == "json" {
+            guard let data = try? Data(contentsOf: file),
+                  let record = try? JSONDecoder().decode(InProgressRecord.self, from: data) else {
+                engineLog("[RECOVER] unreadable record \(file.lastPathComponent), removing it")
+                removeJournal(file)
+                continue
+            }
+            // A recording from this run is still going.
+            guard record.startedAt < cutoff else { continue }
+            let note = URL(fileURLWithPath: record.notePath)
+            guard FileManager.default.fileExists(atPath: note.path),
+                  let content = try? String(contentsOf: note, encoding: .utf8) else {
+                engineLog("[RECOVER] note is gone: \(note.lastPathComponent)")
+                removeJournal(file)
+                continue
+            }
+            let lastWrite = (try? FileManager.default.attributesOfItem(atPath: note.path)[.modificationDate] as? Date) ?? record.startedAt
+            let speakers = speakerNames(inTranscriptOf: content)
+            let saved = await rewriteFrontmatter(
+                filePath: note,
+                startTime: record.startedAt,
+                endTime: max(lastWrite, record.startedAt),
+                speakers: speakers,
+                context: record.context,
+                notice: recoveredNotice
+            )
+            if let saved {
+                engineLog("[RECOVER] finished an interrupted note: \(saved.lastPathComponent)")
+                recovered.append((record.startedAt, saved))
+                removeJournal(file)
+            } else {
+                // Keep the record so the next launch tries again.
+                engineLog("[RECOVER] couldn't update \(note.lastPathComponent); will retry next launch")
+            }
+        }
+        return recovered.sorted { $0.0 < $1.0 }.map(\.1)
+    }
+
+    static var recoveredNotice: String { "> [!warning] Recovered\n> \(AppPaths.displayName) stopped before this recording was saved. This is the transcript written during the call; speaker names weren't refined and the duration ends at the last line written." }
+
+    /// Speaker names from the transcript's "**Name** (HH:mm:ss)" lines.
+    static func speakerNames(inTranscriptOf content: String) -> Set<String> {
+        guard let start = content.range(of: "## Transcript\n") else { return [] }
+        let body = content[start.upperBound...]
+        var names: Set<String> = []
+        let pattern = /^\*\*(.+)\*\* \(\d{2}:\d{2}:\d{2}\)$/
+        for line in body.split(separator: "\n") {
+            if let match = line.wholeMatch(of: pattern) {
+                names.insert(String(match.1))
+            }
+        }
+        return names
+    }
+
     private var fileHandle: FileHandle?
     private var currentFilePath: URL?
     private var sessionStartTime: Date?
@@ -172,6 +267,10 @@ tags:
             throw TranscriptLoggerError.cannotCreateFile(fileURL.path)
         }
         fileHandle = newFileHandle
+
+        let journal = journalDirectory.appendingPathComponent("\(UUID().uuidString).json")
+        writeJournal(InProgressRecord(notePath: fileURL.path, startedAt: now, context: sessionContext), to: journal)
+        currentJournalFile = journal
     }
 
     func append(speaker: String, text: String, timestamp: Date) {
@@ -290,6 +389,11 @@ tags:
 
     func rewriteTranscriptBody(from utterances: [Utterance]) {
         guard let filePath = lastSessionFilePath else { return }
+        // Never replace the lines written during the call with nothing.
+        guard !utterances.isEmpty else {
+            engineLog("[LOGGER] no utterances in memory; keeping the transcript as written during the call")
+            return
+        }
         guard var content = try? String(contentsOf: filePath, encoding: .utf8) else { return }
 
         let marker = "## Transcript\n"
@@ -324,6 +428,8 @@ tags:
             try? FileManager.default.removeItem(at: currentFilePath)
             engineLog("[LOGGER] discarded the note of a recording that didn't start: \(currentFilePath.lastPathComponent)")
         }
+        Self.removeJournal(currentJournalFile)
+        currentJournalFile = nil
         currentFilePath = nil
         sessionStartTime = nil
         speakersDetected = []
@@ -344,6 +450,8 @@ tags:
         lastSessionStartTime = sessionStartTime
         lastSpeakersDetected = speakersDetected
         lastSessionContext = sessionContext
+        lastJournalFile = currentJournalFile
+        currentJournalFile = nil
 
         // Reset state immediately so next session can start
         currentFilePath = nil
@@ -364,11 +472,18 @@ tags:
         lastSessionFilePath = await Self.rewriteFrontmatter(
             filePath: filePath,
             startTime: startTime,
+            endTime: Date(),
             speakers: lastSpeakersDetected,
             context: lastSessionContext
         )
 
         let savedPath = lastSessionFilePath
+        // Saved: nothing left to recover. If the update failed, keep the
+        // record so the next launch finishes the note.
+        if savedPath != nil {
+            Self.removeJournal(lastJournalFile)
+        }
+        lastJournalFile = nil
         lastSessionStartTime = nil
         lastSpeakersDetected = []
         lastSessionContext = ""
@@ -378,13 +493,15 @@ tags:
     private static func rewriteFrontmatter(
         filePath: URL,
         startTime: Date,
+        endTime: Date,
         speakers: Set<String>,
-        context: String
+        context: String,
+        notice: String? = nil
     ) async -> URL? {
         guard var content = try? String(contentsOf: filePath, encoding: .utf8) else { return nil }
 
         // Calculate duration
-        let elapsed = Date().timeIntervalSince(startTime)
+        let elapsed = endTime.timeIntervalSince(startTime)
         let minutes = Int(elapsed) / 60
         let seconds = Int(elapsed) % 60
         let durationStr = String(format: "%02d:%02d", minutes, seconds)
@@ -404,6 +521,11 @@ tags:
         // Update header line (regex to handle already-rewritten values)
         if let range = content.range(of: #"\*\*Duration:\*\* \d{2}:\d{2} \| \*\*Speakers:\*\* \d+"#, options: .regularExpression) {
             content.replaceSubrange(range, with: "**Duration:** \(durationStr) | **Speakers:** \(speakers.count)")
+            // e.g. "Recovered": once, right under the header line.
+            if let notice, !content.contains(notice),
+               let header = content.range(of: #"\*\*Duration:\*\* \d{2}:\d{2} \| \*\*Speakers:\*\* \d+"#, options: .regularExpression) {
+                content.insert(contentsOf: "\n\n" + notice, at: header.upperBound)
+            }
         }
 
         let directory = filePath.deletingLastPathComponent()

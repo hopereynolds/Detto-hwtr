@@ -46,6 +46,13 @@ enum AppPaths {
             .appendingPathComponent(folderName, isDirectory: true)
     }
 
+    /// ~/Library/Application Support/<folder>/recordings-in-progress: one
+    /// small file per recording until its note is saved, so a note left by
+    /// a crash can be finished on the next launch.
+    static var recordingsInProgress: URL {
+        applicationSupport.appendingPathComponent("recordings-in-progress", isDirectory: true)
+    }
+
     /// ~/Library/Caches/<bundle ID>/audio-sessions
     static var audioSessions: URL {
         FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]

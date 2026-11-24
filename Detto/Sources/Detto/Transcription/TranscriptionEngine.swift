@@ -1056,17 +1056,15 @@ final class TranscriptionEngine {
 
     // MARK: - Post-session batch diarization
 
+    /// Relabels the other side's speakers from the recording's audio. The
+    /// audio is kept; call `discardSessionAudio()` once the note is saved.
     func runOfflineDiarization() async {
         guard let audioPath = sysAudioFilePath else { return }
-        guard let engine = offlineDiarEngine, await engine.isReady else {
-            cleanupTempAudio()
-            return
-        }
+        guard let engine = offlineDiarEngine, await engine.isReady else { return }
 
         let hasRemoteUtterances = transcriptStore.utterances.contains { $0.speaker == .them }
         if !hasRemoteUtterances {
             engineLog("[OFFLINE-DIAR] Skipping batch pass (no remote utterances)")
-            cleanupTempAudio()
             return
         }
 
@@ -1084,8 +1082,6 @@ final class TranscriptionEngine {
         } catch {
             engineLog("[OFFLINE-DIAR] Batch pass failed: \(error.localizedDescription)")
         }
-
-        cleanupTempAudio()
     }
 
     private func applyOfflineSpeakerLabels(_ segments: [DiarizationEngine.Segment]) {
@@ -1123,7 +1119,8 @@ final class TranscriptionEngine {
         return 0
     }
 
-    private func cleanupTempAudio() {
+    /// Deletes the recording's temp audio. Call after its note is saved.
+    func discardSessionAudio() {
         if let path = sysAudioFilePath {
             try? FileManager.default.removeItem(at: path)
         }
@@ -1131,10 +1128,15 @@ final class TranscriptionEngine {
         sessionStartTime = nil
     }
 
-    static func cleanupOrphanedAudioFiles() {
+    /// Deletes temp audio left by recordings that ended without a save.
+    /// Only files created before `cutoff` (this launch), so a recording
+    /// started meanwhile keeps its audio.
+    static func cleanupOrphanedAudioFiles(createdBefore cutoff: Date) {
         let cachesDir = AppPaths.audioSessions
-        guard let files = try? FileManager.default.contentsOfDirectory(at: cachesDir, includingPropertiesForKeys: nil) else { return }
+        guard let files = try? FileManager.default.contentsOfDirectory(at: cachesDir, includingPropertiesForKeys: [.creationDateKey]) else { return }
         for file in files {
+            let created = (try? file.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast
+            guard created < cutoff else { continue }
             try? FileManager.default.removeItem(at: file)
         }
     }

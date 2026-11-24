@@ -50,6 +50,8 @@ struct ContentView: View {
     @State private var detectedAppName: String?
     @State private var silenceSeconds: Int = 0
     @State private var savedFileURL: URL?
+    /// The banner's note was recovered at launch, not saved just now.
+    @State private var savedFileWasRecovered = false
     @State private var sessionElapsed: Int = 0
     @State private var editableContext: String = ""
     @State private var genericAttendees: String = ""
@@ -84,6 +86,11 @@ struct ContentView: View {
             }
         }
         .task {
+            let recovered = await LaunchRecovery.runOnce()
+            if let last = recovered.last, savedFileURL == nil, activeSessionType == nil, !isStarting, !isSaving {
+                savedFileWasRecovered = true
+                savedFileURL = last
+            }
             if !hasCompletedOnboarding {
                 showOnboarding = true
             }
@@ -600,7 +607,7 @@ struct ContentView: View {
                         .font(.system(size: 8, weight: .bold))
                         .foregroundStyle(Color.dGreen)
                 )
-            Text("Saved to \(url.lastPathComponent)")
+            Text(savedFileWasRecovered ? "Recovered \(url.lastPathComponent)" : "Saved to \(url.lastPathComponent)")
                 .font(.dMono(size: 11, weight: .bold))
                 .foregroundStyle(Color.dText)
                 .lineLimit(1)
@@ -865,11 +872,14 @@ struct ContentView: View {
 
             transcriptionEngine?.assetStatus = "Finalizing..."
             let savedPath = await transcriptLogger.finalizeFrontmatter()
+            // The note is saved; its temp audio isn't needed any more.
+            transcriptionEngine?.discardSessionAudio()
             transcriptionEngine?.assetStatus = "Ready"
 
             transcriptStore.clear()
 
             if activeSessionType == nil, let savedPath {
+                savedFileWasRecovered = false
                 savedFileURL = savedPath
             }
 
@@ -958,5 +968,24 @@ struct ModelDownloadBanner: View {
                 .fill(Color.dSurface)
                 .shadow(color: .black.opacity(0.15), radius: 8, y: 2)
         )
+    }
+}
+
+/// Finishes what the previous run left unsaved, once per launch: notes of
+/// recordings that never saved, then their temp audio. Only things from
+/// before this launch, so a recording started meanwhile is never touched,
+/// and only once, so reopening the window mid-recording can't either.
+@MainActor
+enum LaunchRecovery {
+    /// Set when the app starts (DettoApp.init touches it).
+    static let launchedAt = Date()
+    private static var ran = false
+
+    static func runOnce() async -> [URL] {
+        guard !ran else { return [] }
+        ran = true
+        let recovered = await TranscriptLogger.recoverInterruptedRecordings(startedBefore: launchedAt)
+        TranscriptionEngine.cleanupOrphanedAudioFiles(createdBefore: launchedAt)
+        return recovered
     }
 }
