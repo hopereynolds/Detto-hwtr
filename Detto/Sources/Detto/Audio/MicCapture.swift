@@ -29,17 +29,90 @@ final class MicCapture: @unchecked Sendable {
         _generation.withLock { $0 == generation }
     }
 
+    /// Uptime (ns) of the last buffer this generation; 0 before the first.
+    private let _lastBufferAt = OSAllocatedUnfairLock<UInt64>(initialState: 0)
+
+    /// No buffer for this long means the mic has stalled. Buffers normally
+    /// arrive every 20-90 ms.
+    static let stallThreshold: Double = 1.5
+
     var audioLevel: Float { _audioLevel.value }
     var captureError: String? { _error.value }
-    var tapIsActive: Bool { _tapActive.value }
+    /// The current capture has delivered at least one buffer.
+    var hasDelivered: Bool { _tapActive.value }
+    /// Seconds since the last buffer, or nil before the first one.
+    var secondsSinceLastBuffer: Double? {
+        let last = _lastBufferAt.withLock { $0 }
+        guard last > 0 else { return nil }
+        return Double(DispatchTime.now().uptimeNanoseconds &- last) / 1_000_000_000
+    }
+    /// Audio is flowing right now: delivered, and not stalled.
+    var tapIsActive: Bool {
+        guard hasDelivered, let age = secondsSinceLastBuffer else { return false }
+        return age < Self.stallThreshold
+    }
+
+    /// One capture source's buffer callback. Each source (direct session,
+    /// engine tap) gets its own, so a source being replaced can be cut off
+    /// with `invalidate()`: a callback already running either finishes
+    /// before `invalidate()` returns or yields nothing.
+    /// Holds no reference to MicCapture: the engine and the capture session
+    /// retain it, and MicCapture owns them.
+    private final class BufferSink: @unchecked Sendable {
+        private let lock = NSLock()
+        private var alive = true
+        private var count = 0
+        private let generation: Int
+        private let generationLock: OSAllocatedUnfairLock<Int>
+        private let tapActive: AtomicBool
+        private let lastBufferAt: OSAllocatedUnfairLock<UInt64>
+        private let level: AudioLevel
+        private let continuation: AsyncStream<AVAudioPCMBuffer>.Continuation
+        private let label: String
+
+        init(label: String, generation: Int, generationLock: OSAllocatedUnfairLock<Int>, tapActive: AtomicBool,
+             lastBufferAt: OSAllocatedUnfairLock<UInt64>, level: AudioLevel,
+             continuation: AsyncStream<AVAudioPCMBuffer>.Continuation) {
+            self.label = label
+            self.generation = generation
+            self.generationLock = generationLock
+            self.tapActive = tapActive
+            self.lastBufferAt = lastBufferAt
+            self.level = level
+            self.continuation = continuation
+        }
+
+        func deliver(_ buffer: AVAudioPCMBuffer) {
+            lock.lock()
+            defer { lock.unlock() }
+            guard alive, generationLock.withLock({ $0 == generation }) else { return }
+            count += 1
+            lastBufferAt.withLock { $0 = DispatchTime.now().uptimeNanoseconds }
+            if count == 1 { tapActive.value = true }
+            let rms = MicCapture.normalizedRMS(from: buffer)
+            level.value = min(rms * 25, 1.0)
+            if count <= 5 || count % 100 == 0 {
+                engineLog("[MIC-6] \(label) #\(count): frames=\(buffer.frameLength) rms=\(rms) level=\(level.value)")
+            }
+            continuation.yield(buffer)
+        }
+
+        func invalidate() {
+            lock.withLock { alive = false }
+        }
+    }
+
+    private func makeSink(_ label: String, generation: Int, continuation: AsyncStream<AVAudioPCMBuffer>.Continuation) -> BufferSink {
+        BufferSink(label: label, generation: generation, generationLock: _generation, tapActive: _tapActive,
+                   lastBufferAt: _lastBufferAt, level: _audioLevel, continuation: continuation)
+    }
 
     func bufferStream(deviceID: AudioDeviceID? = nil) -> AsyncStream<AVAudioPCMBuffer> {
-        let level = _audioLevel
         let errorHolder = _error
         let tapActive = _tapActive
         tapActive.value = false
+        _lastBufferAt.withLock { $0 = 0 }
         let generation = _generation.withLock { value -> Int in value += 1; return value }
-        let generationLock = _generation
 
         return AsyncStream { continuation in
             errorHolder.value = nil
@@ -48,79 +121,69 @@ final class MicCapture: @unchecked Sendable {
             // block for seconds (about 3 s per step when the default input is
             // a Bluetooth headset), and the caller is the main thread: the
             // window froze and system audio waited behind it.
-            self.queue.async {
-                guard self.isCurrent(generation) else {
+            self.queue.async { [weak self] in
+                guard let self, self.isCurrent(generation) else {
                     engineLog("[MIC-1] setup cancelled before it started (stopped)")
                     continuation.finish()
                     return
                 }
                 engineLog("[MIC-1] bufferStream called, deviceID=\(String(describing: deviceID))")
 
-                // Shared by both capture paths: count, report live, meter, yield.
-                var tapCallCount = 0
-                let deliver: (AVAudioPCMBuffer) -> Void = { buffer in
-                    // Captures the lock, not self: the engine retains this
-                    // block, and self owns the engine.
-                    guard generationLock.withLock({ $0 == generation }) else { return }
-                    tapCallCount += 1
-                    if tapCallCount == 1 { tapActive.value = true }
-                    let rms = Self.normalizedRMS(from: buffer)
-                    level.value = min(rms * 25, 1.0)
-
-                    if tapCallCount <= 5 || tapCallCount % 100 == 0 {
-                        engineLog("[MIC-6] tap #\(tapCallCount): frames=\(buffer.frameLength) rms=\(rms) level=\(level.value)")
-                    }
-
-                    continuation.yield(buffer)
-                }
-
                 // A specific device: open it directly, so the system default
                 // input (often the Bluetooth headset) is never touched. Opening
                 // it through AVAudioEngine first wakes the default device, then
                 // switches: about 3 s each with a headset.
                 if let id = deviceID {
+                    let sink = self.makeSink("direct", generation: generation, continuation: continuation)
                     do {
                         let started = Date()
-                        self.direct = try DirectDeviceCapture.start(deviceID: id, onBuffer: deliver)
+                        let opened = try DirectDeviceCapture.start(
+                            deviceID: id,
+                            onBuffer: { sink.deliver($0) },
+                            onStopped: { [weak self] reason in
+                                self?.directCaptureStopped(reason, generation: generation, errorHolder: errorHolder)
+                            }
+                        )
+                        self.direct = opened
                         engineLog("[MIC-DIRECT] opened device \(id) directly (\(Int(Date().timeIntervalSince(started) * 1000))ms)")
                         if !self.isCurrent(generation) {
                             engineLog("[MIC-DIRECT] stopped while opening; closing")
-                            self.direct?.stop()
+                            sink.invalidate()
+                            opened.stop()
                             self.direct = nil
                             continuation.finish()
                             return
                         }
                         // Safety net: if the direct path opens but sends no
-                        // audio, fall back to the old AVAudioEngine path.
-                        let opened = self.direct
-                        self.queue.asyncAfter(deadline: .now() + Self.directFirstAudioTimeout) {
-                            guard self.isCurrent(generation), !tapActive.value,
-                                  let opened, self.direct === opened else { return }
+                        // audio, fall back to the AVAudioEngine path.
+                        self.queue.asyncAfter(deadline: .now() + Self.directFirstAudioTimeout) { [weak self] in
+                            guard let self, self.isCurrent(generation), !tapActive.value,
+                                  self.direct === opened else { return }
                             engineLog("[MIC-DIRECT-FAIL] no audio after \(Self.directFirstAudioTimeout); falling back to AVAudioEngine")
+                            sink.invalidate()
                             opened.stop()
                             self.direct = nil
-                            self.startEngine(
-                                deviceID: deviceID,
-                                generation: generation,
-                                errorHolder: errorHolder,
-                                continuation: continuation,
-                                deliver: deliver
-                            )
+                            self.startEngine(deviceID: deviceID, generation: generation, errorHolder: errorHolder, continuation: continuation)
                         }
                         return
                     } catch {
+                        sink.invalidate()
                         engineLog("[MIC-DIRECT-FAIL] \(error.localizedDescription); falling back to AVAudioEngine")
                     }
                 }
-                self.startEngine(
-                    deviceID: deviceID,
-                    generation: generation,
-                    errorHolder: errorHolder,
-                    continuation: continuation,
-                    deliver: deliver
-                )
+                self.startEngine(deviceID: deviceID, generation: generation, errorHolder: errorHolder, continuation: continuation)
             }
         }
+    }
+
+    /// macOS stopped the direct capture session (runtime error, device
+    /// gone). Mark the mic stalled at once; the engine's mic watchdog sees
+    /// it and reconnects. Called on any thread.
+    private func directCaptureStopped(_ reason: String, generation: Int, errorHolder: SyncString) {
+        guard isCurrent(generation) else { return }
+        engineLog("[MIC-DIRECT-STOPPED] \(reason)")
+        errorHolder.value = "Microphone stopped (\(reason))"
+        _lastBufferAt.withLock { $0 = 1 }  // long ago: stalled now
     }
 
     /// Opens the mic through AVAudioEngine. Only on `queue`.
@@ -128,9 +191,17 @@ final class MicCapture: @unchecked Sendable {
         deviceID: AudioDeviceID?,
         generation: Int,
         errorHolder: SyncString,
-        continuation: AsyncStream<AVAudioPCMBuffer>.Continuation,
-        deliver: @escaping (AVAudioPCMBuffer) -> Void
+        continuation: AsyncStream<AVAudioPCMBuffer>.Continuation
     ) {
+        // Stop or a mic switch may have come in while the direct path was
+        // failing. Check before touching the input node: creating it binds
+        // the default input and can wake the headset.
+        guard isCurrent(generation) else {
+            engineLog("[MIC-2] engine setup cancelled (stopped)")
+            continuation.finish()
+            return
+        }
+        let sink = makeSink("tap", generation: generation, continuation: continuation)
         self.engineInUse = true
 
         // Set input device before accessing inputNode format
@@ -197,13 +268,19 @@ final class MicCapture: @unchecked Sendable {
         }
 
         inputNode.installTap(onBus: 0, bufferSize: 4096, format: tapFormat) { buffer, _ in
-            deliver(buffer)
+            sink.deliver(buffer)
         }
 
         engineLog("[MIC-5] tap installed, preparing engine...")
 
         do {
             self.engine.prepare()
+            guard isCurrent(generation) else {
+                engineLog("[MIC-7] engine setup cancelled before start (stopped)")
+                sink.invalidate()
+                continuation.finish()
+                return
+            }
             engineLog("[MIC-7] engine prepared, starting...")
             try self.engine.start()
             engineLog("[MIC-8] engine started successfully, isRunning=\(self.engine.isRunning)")
@@ -236,6 +313,7 @@ final class MicCapture: @unchecked Sendable {
 
     private func beginStop() {
         _generation.withLock { $0 += 1 }
+        _lastBufferAt.withLock { $0 = 0 }
         _audioLevel.value = 0
         _tapActive.value = false
     }
@@ -278,7 +356,7 @@ final class MicCapture: @unchecked Sendable {
         }
     }
 
-    private static func normalizedRMS(from buffer: AVAudioPCMBuffer) -> Float {
+    fileprivate static func normalizedRMS(from buffer: AVAudioPCMBuffer) -> Float {
         let frameLength = Int(buffer.frameLength)
         let channelCount = Int(max(buffer.format.channelCount, 1))
         guard frameLength > 0 else { return 0 }
@@ -495,21 +573,31 @@ private final class DirectDeviceCapture: NSObject, AVCaptureAudioDataOutputSampl
     private let output = AVCaptureAudioDataOutput()
     private let sampleQueue = DispatchQueue(label: "detto.mic-capture.samples", qos: .userInitiated)
     private let onBuffer: (AVAudioPCMBuffer) -> Void
-    private var runtimeErrorObserver: NSObjectProtocol?
+    private let onStopped: (String) -> Void
+    private var observers: [NSObjectProtocol] = []
+    /// Set by stop(), so our own stop isn't reported as a failure.
+    private let stopping = AtomicBool()
 
-    private init(onBuffer: @escaping (AVAudioPCMBuffer) -> Void) {
+    private init(onBuffer: @escaping (AVAudioPCMBuffer) -> Void, onStopped: @escaping (String) -> Void) {
         self.onBuffer = onBuffer
+        self.onStopped = onStopped
     }
 
     /// Blocks while the device opens; call off the main thread.
-    static func start(deviceID: AudioDeviceID, onBuffer: @escaping (AVAudioPCMBuffer) -> Void) throws -> DirectDeviceCapture {
+    /// `onStopped` is called if macOS stops the session (runtime error,
+    /// device gone, interruption), not for stop().
+    static func start(
+        deviceID: AudioDeviceID,
+        onBuffer: @escaping (AVAudioPCMBuffer) -> Void,
+        onStopped: @escaping (String) -> Void
+    ) throws -> DirectDeviceCapture {
         // On macOS a capture device's uniqueID is the CoreAudio device UID.
         guard let uid = MicCapture.deviceUID(for: deviceID),
               let device = AVCaptureDevice(uniqueID: uid),
               device.hasMediaType(.audio) else {
             throw Failure.noCaptureDevice(deviceID)
         }
-        let capture = DirectDeviceCapture(onBuffer: onBuffer)
+        let capture = DirectDeviceCapture(onBuffer: onBuffer, onStopped: onStopped)
         let session = capture.session
         session.beginConfiguration()
         let input = try AVCaptureDeviceInput(device: device)
@@ -528,21 +616,35 @@ private final class DirectDeviceCapture: NSObject, AVCaptureAudioDataOutputSampl
         session.addOutput(capture.output)
         session.commitConfiguration()
 
-        capture.runtimeErrorObserver = NotificationCenter.default.addObserver(
-            forName: AVCaptureSession.runtimeErrorNotification, object: session, queue: nil
-        ) { note in
-            let error = note.userInfo?[AVCaptureSessionErrorKey] as? NSError
-            engineLog("[MIC-DIRECT-ERR] capture session error: \(error?.localizedDescription ?? "unknown")")
-        }
+        // Observers hold the capture weakly: the session (owned by the
+        // capture) must not keep it alive.
+        let center = NotificationCenter.default
+        capture.observers = [
+            center.addObserver(forName: AVCaptureSession.runtimeErrorNotification, object: session, queue: nil) { [weak capture] note in
+                let error = note.userInfo?[AVCaptureSessionErrorKey] as? NSError
+                capture?.reportStop("capture error: \(error?.localizedDescription ?? "unknown")")
+            },
+            center.addObserver(forName: AVCaptureSession.didStopRunningNotification, object: session, queue: nil) { [weak capture] _ in
+                capture?.reportStop("capture session stopped")
+            },
+            center.addObserver(forName: AVCaptureSession.wasInterruptedNotification, object: session, queue: nil) { [weak capture] _ in
+                capture?.reportStop("capture session interrupted")
+            },
+        ]
         session.startRunning()
         return capture
     }
 
+    private func reportStop(_ reason: String) {
+        guard !stopping.value else { return }
+        engineLog("[MIC-DIRECT-ERR] \(reason)")
+        onStopped(reason)
+    }
+
     func stop() {
-        if let runtimeErrorObserver {
-            NotificationCenter.default.removeObserver(runtimeErrorObserver)
-        }
-        runtimeErrorObserver = nil
+        stopping.value = true
+        observers.forEach(NotificationCenter.default.removeObserver)
+        observers = []
         session.stopRunning()
         output.setSampleBufferDelegate(nil, queue: nil)
     }

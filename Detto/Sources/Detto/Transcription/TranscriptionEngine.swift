@@ -118,6 +118,11 @@ final class TranscriptionEngine {
     private var diarUpdateTask: Task<Void, Never>?
     /// Keeps the mic stream alive for the audio level meter when transcription isn't running.
     private var micKeepAliveTask: Task<Void, Never>?
+    private var micWatchdogTask: Task<Void, Never>?
+
+    private static let micLostMessage = "Microphone stopped sending audio. Reconnecting..."
+    private static let micGaveUpMessage = "Microphone stopped and couldn't be reconnected. Stop and start again, or check the input in System Settings."
+    private static let micDisconnectedMessage = "Microphone disconnected. System audio continues."
     private var deviceRestartTask: Task<Void, Never>?
 
     // Diarization state — updated from diarization update stream, read during attribution
@@ -542,6 +547,7 @@ final class TranscriptionEngine {
         watchFirstAudio(since: startedAt)
 
         installDefaultDeviceListener()
+        startMicWatchdog()
         return true
     }
 
@@ -557,7 +563,8 @@ final class TranscriptionEngine {
     }
 
     /// Restart only the mic capture with a new device, keeping system audio and models intact.
-    func restartMic(inputDeviceID: AudioDeviceID) {
+    /// `force` restarts even on the same device (to recover a stalled mic).
+    func restartMic(inputDeviceID: AudioDeviceID, force: Bool = false) {
         guard isRunning, let asrEngine else { return }
 
         if inputDeviceID != 0 || userSelectedDeviceID != 0 {
@@ -565,7 +572,7 @@ final class TranscriptionEngine {
         }
         let resolved = resolveMicDevice(userSelected: inputDeviceID)
         let resolvedMicID = resolved.tracked
-        guard resolvedMicID != currentMicDeviceID else {
+        guard force || resolvedMicID != currentMicDeviceID else {
             engineLog("[ENGINE-MIC-SWAP] same device \(resolvedMicID), skipping")
             return
         }
@@ -642,7 +649,7 @@ final class TranscriptionEngine {
             try? await Task.sleep(for: .seconds(3))
             guard self.isRunning, !self.micCapture.tapIsActive else { return }
             engineLog("[ENGINE-MIC-WATCHDOG] No mic activity 3s after restart")
-            self.lastError = "Microphone disconnected. System audio continues."
+            self.lastError = Self.micDisconnectedMessage
         }
     }
 
@@ -835,6 +842,57 @@ final class TranscriptionEngine {
         }
     }
 
+    /// Watches the mic for the whole session. If it stops delivering audio
+    /// after it had started (Bluetooth handoff, macOS ending the capture),
+    /// LIVE drops right away (micIsLive checks freshness), and this
+    /// reconnects it: up to 3 tries, 5 s apart. A stall during startup is
+    /// left to watchFirstAudio.
+    private func startMicWatchdog() {
+        micWatchdogTask?.cancel()
+        micWatchdogTask = Task { [weak self] in
+            var lastRestart: Date?
+            var attempts = 0
+            var gaveUp = false
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(1))
+                guard let self, self.isRunning, !Task.isCancelled else { return }
+                let mic = self.micCapture
+                if mic.tapIsActive {
+                    if attempts > 0 || gaveUp {
+                        engineLog("[ENGINE-MIC-WATCH] mic audio is back")
+                        if [Self.micLostMessage, Self.micGaveUpMessage, Self.micDisconnectedMessage].contains(self.lastError) {
+                            self.lastError = nil
+                        }
+                        attempts = 0
+                        gaveUp = false
+                    }
+                    continue
+                }
+                let sinceRestart = lastRestart.map { Date().timeIntervalSince($0) }
+                if let sinceRestart, sinceRestart < 5 { continue }
+                // Stalled after delivering, or a reconnect that never delivered.
+                let stalled = mic.hasDelivered
+                    ? (mic.secondsSinceLastBuffer ?? 0) >= 3
+                    : sinceRestart != nil
+                guard stalled else { continue }
+                guard attempts < 3 else {
+                    if !gaveUp {
+                        engineLog("[ENGINE-MIC-WATCH] giving up after \(attempts) reconnects")
+                        self.lastError = Self.micGaveUpMessage
+                        gaveUp = true
+                    }
+                    continue
+                }
+                attempts += 1
+                let age = mic.secondsSinceLastBuffer.map { String(format: "%.1fs", $0) } ?? "never"
+                engineLog("[ENGINE-MIC-WATCH] no mic audio (last buffer \(age) ago\(mic.captureError.map { ", \($0)" } ?? "")); reconnecting, attempt \(attempts)")
+                self.lastError = Self.micLostMessage
+                lastRestart = Date()
+                self.restartMic(inputDeviceID: self.userSelectedDeviceID, force: true)
+            }
+        }
+    }
+
     func stop() async {
         engineLog("[ENGINE-STOP] stop() called, cancelling all tasks")
         while isStarting {
@@ -854,6 +912,8 @@ final class TranscriptionEngine {
         sysLoopTask?.cancel()
         diarUpdateTask?.cancel()
         micKeepAliveTask?.cancel()
+        micWatchdogTask?.cancel()
+        micWatchdogTask = nil
         micReaderTask = nil
         micTranscribeTask = nil
         sysLoopTask = nil
