@@ -30,6 +30,10 @@ struct ContentView: View {
     @State private var showOnboarding = false
     @State private var audioLevel: Float = 0
     @State private var activeSessionType: SessionType?
+    /// True from Stop until the stopped session's note is fully written.
+    /// Starting a new session meanwhile would clear the transcript the old
+    /// one is still saving, leaving an empty note (Nov 4).
+    @State private var isSaving = false
     @State private var activeClient: ClientInfo?
     @State private var detectedAppName: String?
     @State private var silenceSeconds: Int = 0
@@ -302,6 +306,7 @@ struct ContentView: View {
                 BriefingPanelView(
                     selectedClient: activeClient ?? clientRegistry.selectedClient,
                     isRecording: false,
+                    isSaving: isSaving,
                     silenceSeconds: silenceSeconds,
                     editableContext: $editableContext,
                     genericAttendees: $genericAttendees,
@@ -388,6 +393,7 @@ struct ContentView: View {
                 silenceSeconds: silenceSeconds,
                 statusMessage: transcriptionEngine?.assetStatus,
                 errorMessage: transcriptionEngine?.lastError,
+                isSaving: isSaving,
                 onStartCallCapture: { startSession(type: .callCapture) },
                 onStartVoiceMemo: { startSession(type: .voiceMemo) },
                 onStop: stopSession
@@ -512,6 +518,11 @@ struct ContentView: View {
 
     /// Start a client-specific recording. Captures frontmost app synchronously before async work.
     private func startClientRecording() {
+        guard !isSaving else {
+            engineLog("[SESSION-GUARD] start ignored: previous session still saving")
+            NSSound.beep()
+            return
+        }
         let client = clientRegistry.selectedClient
         activeClient = client
         savedFileURL = nil
@@ -567,6 +578,11 @@ struct ContentView: View {
     }
 
     private func startSession(type: SessionType) {
+        guard !isSaving else {
+            engineLog("[SESSION-GUARD] start ignored: previous session still saving")
+            NSSound.beep()
+            return
+        }
         // If in side-by-side mode with a selected client, use client recording
         if clientRegistry.hasClients && clientRegistry.selectedClient != nil && type == .callCapture {
             startClientRecording()
@@ -651,6 +667,8 @@ struct ContentView: View {
     }
 
     private func stopSession() {
+        guard !isSaving, isRunning || activeSessionType != nil else { return }
+        isSaving = true
         activeSessionType = nil
         detectedAppName = nil
         silenceSeconds = 0
@@ -697,6 +715,7 @@ struct ContentView: View {
             }
 
             activeClient = nil
+            isSaving = false
         }
     }
 

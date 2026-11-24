@@ -13,6 +13,17 @@ struct PulsingDot: View {
     }
 }
 
+/// Shown in place of the Start actions while the last recording is saved.
+struct SavingNotice: View {
+    var body: some View {
+        Text("Saving the last recording. You can start a new one when it's done.")
+            .font(.dMono(size: 10, weight: .medium))
+            .foregroundStyle(Color.dSecondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+}
+
 struct ControlBar: View {
     let isRecording: Bool
     let activeSessionType: SessionType?
@@ -22,6 +33,7 @@ struct ControlBar: View {
     let statusMessage: String?
     let errorMessage: String?
     var activeClientName: String? = nil
+    var isSaving: Bool = false
     let onStartCallCapture: () -> Void
     let onStartVoiceMemo: () -> Void
     let onStop: () -> Void
@@ -84,6 +96,11 @@ struct ControlBar: View {
                 .padding(.horizontal, 12)
                 .padding(.vertical, 10)
             } else {
+                if isSaving {
+                    SavingNotice()
+                        .padding(.horizontal, 16)
+                        .padding(.top, 6)
+                }
                 HStack(spacing: 10) {
                     Button(action: onStartCallCapture) {
                         HStack(spacing: 4) {
@@ -125,6 +142,8 @@ struct ControlBar: View {
                     .buttonStyle(.plain)
                     .keyboardShortcut("r", modifiers: [.command, .shift])
                 }
+                .disabled(isSaving)
+                .opacity(isSaving ? 0.5 : 1)
                 .padding(.horizontal, 12)
                 .padding(.vertical, 10)
             }
