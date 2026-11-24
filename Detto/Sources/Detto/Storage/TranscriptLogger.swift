@@ -27,16 +27,25 @@ actor TranscriptLogger {
         ".detto_tmp-\(UUID().uuidString).md"
     }
 
-    /// `name.md`, or `name (2).md` etc. if that file already exists, so a
-    /// new recording never overwrites an existing note.
-    private static func availableFileURL(in directory: URL, baseName: String) -> URL {
-        var candidate = directory.appendingPathComponent("\(baseName).md")
-        var n = 2
-        while FileManager.default.fileExists(atPath: candidate.path) {
-            candidate = directory.appendingPathComponent("\(baseName) (\(n)).md")
-            n += 1
+    /// `name.md`, then `name (2).md`, `name (3).md`, ...
+    private static func candidateNames(_ baseName: String) -> [String] {
+        ["\(baseName).md"] + (2...999).map { "\(baseName) (\($0)).md" }
+    }
+
+    /// Creates `name.md` (or `name (2).md` etc.) and opens it for writing.
+    /// Creation is exclusive (O_EXCL), so a new recording never overwrites
+    /// an existing note, even if another app claims the name at the same
+    /// moment.
+    private static func createNewFile(in directory: URL, baseName: String) throws -> (URL, FileHandle) {
+        for name in candidateNames(baseName) {
+            let url = directory.appendingPathComponent(name)
+            let fd = open(url.path, O_WRONLY | O_CREAT | O_EXCL, 0o644)
+            if fd >= 0 {
+                return (url, FileHandle(fileDescriptor: fd, closeOnDealloc: true))
+            }
+            guard errno == EEXIST else { break }
         }
-        return candidate
+        throw TranscriptLoggerError.cannotCreateFile(directory.appendingPathComponent("\(baseName).md").path)
     }
 
     private var fileHandle: FileHandle?
@@ -82,7 +91,7 @@ actor TranscriptLogger {
         let logTag = isVoiceMemo ? "log/voice" : "log/meeting"
         let sourceTag = isVoiceMemo ? "source/voice" : "source/meeting"
 
-        let fileURL = Self.availableFileURL(in: directory, baseName: "\(fileFmt.string(from: now)) \(fileLabel)")
+        let (fileURL, newFileHandle) = try Self.createNewFile(in: directory, baseName: "\(fileFmt.string(from: now)) \(fileLabel)")
         let filename = fileURL.lastPathComponent
         currentFilePath = fileURL
 
@@ -154,10 +163,15 @@ tags:
 
 """
 
-        let created = FileManager.default.createFile(atPath: currentFilePath!.path, contents: content.data(using: .utf8))
-        guard created else { throw TranscriptLoggerError.cannotCreateFile(currentFilePath!.path) }
-        fileHandle = try FileHandle(forWritingTo: currentFilePath!)
-        fileHandle?.seekToEndOfFile()
+        do {
+            try newFileHandle.write(contentsOf: Data(content.utf8))
+        } catch {
+            try? newFileHandle.close()
+            try? FileManager.default.removeItem(at: fileURL)
+            currentFilePath = nil
+            throw TranscriptLoggerError.cannotCreateFile(fileURL.path)
+        }
+        fileHandle = newFileHandle
     }
 
     func append(speaker: String, text: String, timestamp: Date) {
@@ -329,23 +343,14 @@ tags:
         guard let filePath = lastSessionFilePath,
               let startTime = lastSessionStartTime else { return nil }
 
-        await Self.rewriteFrontmatter(
+        // Where the note actually ended up: renamed, or still at its
+        // original name if the rename couldn't happen. nil if unreadable.
+        lastSessionFilePath = await Self.rewriteFrontmatter(
             filePath: filePath,
             startTime: startTime,
             speakers: lastSpeakersDetected,
             context: lastSessionContext
         )
-
-        // Update lastSessionFilePath if the file was renamed
-        if !lastSessionContext.isEmpty {
-            let truncated = Self.cleanFilenameContext(lastSessionContext)
-            let dateFmt = DateFormatter()
-            dateFmt.dateFormat = "yyyy-MM-dd HH-mm-ss"
-            let datePrefix = dateFmt.string(from: startTime)
-            let newFilename = "\(datePrefix) \(truncated).md"
-            let newPath = filePath.deletingLastPathComponent().appendingPathComponent(newFilename)
-            lastSessionFilePath = newPath
-        }
 
         let savedPath = lastSessionFilePath
         lastSessionStartTime = nil
@@ -359,8 +364,8 @@ tags:
         startTime: Date,
         speakers: Set<String>,
         context: String
-    ) async {
-        guard var content = try? String(contentsOf: filePath, encoding: .utf8) else { return }
+    ) async -> URL? {
+        guard var content = try? String(contentsOf: filePath, encoding: .utf8) else { return nil }
 
         // Calculate duration
         let elapsed = Date().timeIntervalSince(startTime)
@@ -385,37 +390,51 @@ tags:
             content.replaceSubrange(range, with: "**Duration:** \(durationStr) | **Speakers:** \(speakers.count)")
         }
 
-        // Context-based file rename
-        var finalPath = filePath
+        let directory = filePath.deletingLastPathComponent()
+
+        // Context-based file rename. Each candidate name is claimed with an
+        // exclusive rename (RENAME_EXCL), so an existing note is never
+        // replaced; if the name is taken, try "name (2).md" and so on.
         if !context.isEmpty {
             let truncated = cleanFilenameContext(context)
 
             let dateFmt = DateFormatter()
             dateFmt.dateFormat = "yyyy-MM-dd HH-mm-ss"
             let datePrefix = dateFmt.string(from: startTime)
-            let newFilename = "\(datePrefix) \(truncated).md"
-            let newPath = filePath.deletingLastPathComponent().appendingPathComponent(newFilename)
 
-            // Update source_file in content
-            if let range = content.range(of: #"source_file: ".*""#, options: .regularExpression) {
-                content.replaceSubrange(range, with: "source_file: \(yamlScalar(newFilename))")
+            for newFilename in candidateNames("\(datePrefix) \(truncated)") {
+                let newPath = directory.appendingPathComponent(newFilename)
+                if newPath.path == filePath.path { break }  // already named this
+
+                var renamed = content
+                if let range = renamed.range(of: #"source_file: ".*""#, options: .regularExpression) {
+                    renamed.replaceSubrange(range, with: "source_file: \(yamlScalar(newFilename))")
+                }
+                let tmpPath = directory.appendingPathComponent(Self.tempFilename())
+                do {
+                    try renamed.write(to: tmpPath, atomically: false, encoding: .utf8)
+                } catch {
+                    break
+                }
+                if renamex_np(tmpPath.path, newPath.path, UInt32(RENAME_EXCL)) == 0 {
+                    try? FileManager.default.removeItem(at: filePath)
+                    return newPath
+                }
+                let renameError = errno
+                try? FileManager.default.removeItem(at: tmpPath)
+                guard renameError == EEXIST else { break }
             }
-
-            finalPath = newPath
         }
 
-        let tmpPath = filePath.deletingLastPathComponent().appendingPathComponent(Self.tempFilename())
+        // No rename (or it failed): update the note where it is.
+        let tmpPath = directory.appendingPathComponent(Self.tempFilename())
         do {
             try content.write(to: tmpPath, atomically: true, encoding: .utf8)
-            if finalPath != filePath {
-                try FileManager.default.moveItem(at: tmpPath, to: finalPath)
-                try? FileManager.default.removeItem(at: filePath)
-            } else {
-                _ = try FileManager.default.replaceItemAt(filePath, withItemAt: tmpPath)
-            }
+            _ = try FileManager.default.replaceItemAt(filePath, withItemAt: tmpPath)
         } catch {
             try? FileManager.default.removeItem(at: tmpPath)
         }
+        return filePath
     }
 
     /// Extract clean client name for filenames — strips everything after " | "
