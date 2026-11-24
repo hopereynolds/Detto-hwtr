@@ -722,13 +722,10 @@ struct ContentView: View {
                 inputDeviceID: settings.inputDeviceID,
                 appBundleID: appName != nil ? bundleID : nil,
                 preferBuiltInMic: settings.preferBuiltInMicDuringCalls,
-                vocabularyCorrector: corrector
+                vocabularyCorrector: corrector,
+                systemAudioPath: await transcriptLogger.currentAudioPath
             ) ?? false
-            if started {
-                await transcriptLogger.attachAudio(transcriptionEngine?.sessionAudioPath)
-            } else {
-                await abandonFailedStart()
-            }
+            if !started { await abandonFailedStart() }
         }
     }
 
@@ -823,7 +820,8 @@ struct ContentView: View {
                     inputDeviceID: settings.inputDeviceID,
                     appBundleID: appBundleID,
                     preferBuiltInMic: settings.preferBuiltInMicDuringCalls,
-                    vocabularyCorrector: corrector
+                    vocabularyCorrector: corrector,
+                    systemAudioPath: await transcriptLogger.currentAudioPath
                 ) ?? false
             } else {
                 started = await transcriptionEngine?.start(
@@ -833,11 +831,7 @@ struct ContentView: View {
                     vocabularyCorrector: corrector
                 ) ?? false
             }
-            if started {
-                await transcriptLogger.attachAudio(transcriptionEngine?.sessionAudioPath)
-            } else {
-                await abandonFailedStart()
-            }
+            if !started { await abandonFailedStart() }
         }
     }
 
@@ -1006,10 +1000,12 @@ enum LaunchRecovery {
         guard !ran else { return TranscriptLogger.RecoveryResult() }
         ran = true
         let result = await TranscriptLogger.recoverInterruptedRecordings(startedBefore: launchedAt)
-        TranscriptionEngine.cleanupOrphanedAudioFiles(
-            createdBefore: launchedAt,
-            keeping: TranscriptLogger.audioPathsInProgress()
-        )
+        // If the records can't be listed, keep all audio rather than guess.
+        if let kept = TranscriptLogger.audioNamesInProgress() {
+            TranscriptionEngine.cleanupOrphanedAudioFiles(createdBefore: launchedAt, keeping: kept)
+        } else {
+            engineLog("[RECOVER] couldn't list recovery records; skipping temp audio cleanup")
+        }
         return result
     }
 }

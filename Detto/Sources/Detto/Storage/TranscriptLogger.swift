@@ -2,8 +2,12 @@ import Foundation
 
 enum TranscriptLoggerError: LocalizedError {
     case cannotCreateFile(String)
+    case cannotPrepareRecovery
     var errorDescription: String? {
-        switch self { case .cannotCreateFile(let p): return "Cannot create transcript at \(p)" }
+        switch self {
+        case .cannotCreateFile(let p): return "Cannot create transcript at \(p)"
+        case .cannotPrepareRecovery: return "Couldn't set up crash recovery for this recording, so it didn't start. Check that your disk isn't full."
+        }
     }
 }
 
@@ -72,11 +76,19 @@ actor TranscriptLogger {
     }
 
     private let journalDirectory: URL
+    private let audioDirectory: URL
     private var currentJournal: Journal?
     private var lastJournal: Journal?
 
-    init(journalDirectory: URL = AppPaths.recordingsInProgress) {
+    init(journalDirectory: URL = AppPaths.recordingsInProgress, audioDirectory: URL = AppPaths.audioSessions) {
         self.journalDirectory = journalDirectory
+        self.audioDirectory = audioDirectory
+    }
+
+    /// Where the current recording's temp audio goes: named after the
+    /// recording, and already in its record before capture starts.
+    var currentAudioPath: URL? {
+        currentJournal?.record.audioPath.map { URL(fileURLWithPath: $0) }
     }
 
     @discardableResult
@@ -112,6 +124,25 @@ actor TranscriptLogger {
         return URL(fileURLWithPath: pending)
     }
 
+    /// Whether a note is this recording's: it carries the recording's ID.
+    /// A note from before IDs existed (no `detto_recording` line at all)
+    /// counts by path; the recovered copy gets the ID.
+    private static func isOwnNote(_ content: String, of journal: Journal) -> Bool {
+        content.contains(recordingLine(journal.recordingID)) || !content.contains("detto_recording:")
+    }
+
+    enum NoteState { case present, missing, inaccessible }
+
+    /// Missing only if its folder can be listed and the note isn't in it;
+    /// a folder macOS won't let us read (or that's gone, like an unplugged
+    /// drive) is inaccessible, so its recovery data is kept.
+    static func noteState(_ note: URL) -> NoteState {
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: note.deletingLastPathComponent().path) else {
+            return .inaccessible
+        }
+        return names.contains(note.lastPathComponent) ? .present : .missing
+    }
+
     /// Before a save publishes the renamed note, note where it's going, so
     /// a retry after a crash recognizes it instead of saving a second copy.
     private static func pendingWriter(for journal: Journal) -> @Sendable (URL) -> Bool {
@@ -122,15 +153,6 @@ actor TranscriptLogger {
             updated.pendingPath = pending.path
             return writeJournal(updated, to: url)
         }
-    }
-
-    /// Tie the recording's temp audio to its record, so it's kept until the
-    /// note is saved (or recovered).
-    func attachAudio(_ path: URL?) {
-        guard let path, var journal = currentJournal else { return }
-        journal.record.audioPath = path.path
-        Self.writeJournal(journal.record, to: journal.url)
-        currentJournal = journal
     }
 
     struct RecoveryResult {
@@ -165,9 +187,12 @@ actor TranscriptLogger {
             let note = URL(fileURLWithPath: record.notePath)
 
             // An interrupted save already published the renamed note:
-            // finish its cleanup instead of saving a second copy.
+            // finish its cleanup instead of saving a second copy. The
+            // original is removed only if it's still this recording's.
             if let published = publishedNote(of: journal) {
-                if published.path != note.path {
+                if published.path != note.path,
+                   let original = try? String(contentsOf: note, encoding: .utf8),
+                   isOwnNote(original, of: journal) {
                     try? FileManager.default.removeItem(at: note)
                 }
                 engineLog("[RECOVER] note was already saved as \(published.lastPathComponent); cleaning up")
@@ -175,13 +200,27 @@ actor TranscriptLogger {
                 recovered.append((record.startedAt, published))
                 continue
             }
-            guard FileManager.default.fileExists(atPath: note.path) else {
+            switch noteState(note) {
+            case .present:
+                break
+            case .missing:
                 engineLog("[RECOVER] note is gone: \(note.lastPathComponent)")
                 finishJournal(journal)
+                continue
+            case .inaccessible:
+                engineLog("[RECOVER] can't reach the folder of \(note.lastPathComponent); will retry next launch")
+                result.failed += 1
                 continue
             }
             guard let content = try? String(contentsOf: note, encoding: .utf8) else {
                 engineLog("[RECOVER] can't read \(note.lastPathComponent); will retry next launch")
+                result.failed += 1
+                continue
+            }
+            guard isOwnNote(content, of: journal) else {
+                // Something else now lives at that path. Leave it alone and
+                // keep the record (and audio) rather than guess.
+                engineLog("[RECOVER] \(note.lastPathComponent) belongs to another recording; leaving it and keeping the record")
                 result.failed += 1
                 continue
             }
@@ -193,6 +232,7 @@ actor TranscriptLogger {
                 speakers: speakerNames(inTranscriptOf: content),
                 context: record.context,
                 notice: recoveredNotice,
+                recordingID: journal.recordingID,
                 willPublish: pendingWriter(for: journal)
             )
             if let saved {
@@ -208,18 +248,31 @@ actor TranscriptLogger {
         return result
     }
 
-    /// Temp audio that unsaved notes still need; launch cleanup keeps it.
-    static func audioPathsInProgress(journalDirectory: URL = AppPaths.recordingsInProgress) -> Set<String> {
-        guard let files = try? FileManager.default.contentsOfDirectory(at: journalDirectory, includingPropertiesForKeys: nil) else { return [] }
-        var paths: Set<String> = []
-        for file in files where file.pathExtension == "json" {
+    /// Names of temp audio files that unsaved notes may still need: every
+    /// recording with a record (even one that can't be decoded, by its file
+    /// name) plus any audio path a record names. nil if the records can't be
+    /// listed, in which case launch cleanup deletes nothing.
+    static func audioNamesInProgress(journalDirectory: URL = AppPaths.recordingsInProgress) -> Set<String>? {
+        let files: [URL]
+        do {
+            files = try FileManager.default.contentsOfDirectory(at: journalDirectory, includingPropertiesForKeys: nil)
+        } catch CocoaError.fileReadNoSuchFile {
+            return []
+        } catch {
+            return nil
+        }
+        var names: Set<String> = []
+        for file in files {
+            // "<id>.json" or "<id>.json.bad"
+            let id = file.lastPathComponent.components(separatedBy: ".").first ?? ""
+            if !id.isEmpty { names.insert("\(id).raw") }
             if let data = try? Data(contentsOf: file),
                let record = try? JSONDecoder().decode(InProgressRecord.self, from: data),
                let audio = record.audioPath {
-                paths.insert(audio)
+                names.insert(URL(fileURLWithPath: audio).lastPathComponent)
             }
         }
-        return paths
+        return names
     }
 
     static var recoveredNotice: String { "> [!warning] Recovered\n> This note wasn't finished when the recording ended (\(AppPaths.displayName) quit or couldn't save it). This is the transcript written during the call; speaker names weren't refined and the duration ends at the last line written." }
@@ -365,11 +418,25 @@ tags:
         }
         fileHandle = newFileHandle
 
+        // The recovery record, with the audio path, exists before any
+        // capture can write audio. Without it a crash could lose the note's
+        // ending and its audio, so a recording that can't have one doesn't
+        // start.
         let journal = Journal(
             url: journalDirectory.appendingPathComponent("\(recordingID).json"),
-            record: InProgressRecord(notePath: fileURL.path, startedAt: now, context: sessionContext)
+            record: InProgressRecord(
+                notePath: fileURL.path,
+                startedAt: now,
+                context: sessionContext,
+                audioPath: audioDirectory.appendingPathComponent("\(recordingID).raw").path
+            )
         )
-        Self.writeJournal(journal.record, to: journal.url)
+        guard Self.writeJournal(journal.record, to: journal.url) else {
+            try? newFileHandle.close()
+            try? FileManager.default.removeItem(at: fileURL)
+            currentFilePath = nil
+            throw TranscriptLoggerError.cannotPrepareRecovery
+        }
         currentJournal = journal
     }
 
@@ -598,9 +665,17 @@ tags:
         speakers: Set<String>,
         context: String,
         notice: String? = nil,
+        recordingID: String? = nil,
         willPublish: (@Sendable (URL) -> Bool)? = nil
     ) async -> URL? {
         guard var content = try? String(contentsOf: filePath, encoding: .utf8) else { return nil }
+
+        // A note from before recording IDs: add it, so another interrupted
+        // save of this copy can be recognized.
+        if let recordingID, !content.contains("detto_recording:"),
+           let version = content.range(of: #"detto_version: ".*"\n"#, options: .regularExpression) {
+            content.insert(contentsOf: recordingLine(recordingID) + "\n", at: version.upperBound)
+        }
 
         // Calculate duration
         let elapsed = endTime.timeIntervalSince(startTime)

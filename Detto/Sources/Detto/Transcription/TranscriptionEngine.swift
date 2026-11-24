@@ -254,7 +254,9 @@ final class TranscriptionEngine {
     /// Returns false if the session didn't start (lastError says why), so
     /// the caller can close the note and let Start be pressed again.
     @discardableResult
-    func start(locale: Locale, inputDeviceID: AudioDeviceID = 0, appBundleID: String? = nil, micOnly: Bool = false, preferBuiltInMic: Bool = true, vocabularyCorrector: VocabularyCorrector? = nil) async -> Bool {
+    /// `systemAudioPath` is where the call audio is kept for the speaker
+    /// pass; the recording's recovery record already names it.
+    func start(locale: Locale, inputDeviceID: AudioDeviceID = 0, appBundleID: String? = nil, micOnly: Bool = false, preferBuiltInMic: Bool = true, vocabularyCorrector: VocabularyCorrector? = nil, systemAudioPath: URL? = nil) async -> Bool {
         engineLog("[ENGINE-0] start() called, isRunning=\(isRunning)")
         guard !isRunning, !isStarting else { return false }
         isStarting = true
@@ -447,9 +449,9 @@ final class TranscriptionEngine {
 
             // Create temp audio file for post-session batch diarization
             if offlineDiarEngine != nil {
-                let cachesDir = AppPaths.audioSessions
-                try? FileManager.default.createDirectory(at: cachesDir, withIntermediateDirectories: true)
-                let audioPath = cachesDir.appendingPathComponent("\(UUID().uuidString).raw")
+                let audioPath = systemAudioPath
+                    ?? AppPaths.audioSessions.appendingPathComponent("\(UUID().uuidString).raw")
+                try? FileManager.default.createDirectory(at: audioPath.deletingLastPathComponent(), withIntermediateDirectories: true)
                 FileManager.default.createFile(atPath: audioPath.path, contents: nil)
                 sysAudioFilePath = audioPath
                 sysAudioFileHandle = try? FileHandle(forWritingTo: audioPath)
@@ -1119,9 +1121,6 @@ final class TranscriptionEngine {
         return 0
     }
 
-    /// The current recording's temp audio, if it has one.
-    var sessionAudioPath: URL? { sysAudioFilePath }
-
     /// The note couldn't be saved: let go of the audio without deleting
     /// it. Its recovery record keeps it until the note is recovered.
     func keepSessionAudioForRecovery() {
@@ -1142,10 +1141,9 @@ final class TranscriptionEngine {
     /// Only files created before `cutoff` (this launch), so a recording
     /// started meanwhile keeps its audio, and never audio an unsaved
     /// note's recovery record still holds.
-    static func cleanupOrphanedAudioFiles(createdBefore cutoff: Date, keeping inUse: Set<String>) {
+    static func cleanupOrphanedAudioFiles(createdBefore cutoff: Date, keeping keptNames: Set<String>) {
         let cachesDir = AppPaths.audioSessions
         guard let files = try? FileManager.default.contentsOfDirectory(at: cachesDir, includingPropertiesForKeys: [.creationDateKey]) else { return }
-        let keptNames = Set(inUse.map { URL(fileURLWithPath: $0).lastPathComponent })
         for file in files {
             let created = (try? file.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast
             guard created < cutoff, !keptNames.contains(file.lastPathComponent) else { continue }
