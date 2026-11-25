@@ -85,6 +85,32 @@ final class TranscriptionEngine {
     /// Combined audio level from mic and system for the UI meter.
     var audioLevel: Float { max(micCapture.audioLevel, systemCapture.audioLevel) }
 
+    /// The mic has delivered audio since the session (or last mic restart)
+    /// started. Not observable: poll it.
+    var micIsLive: Bool { micCapture.tapIsActive }
+    /// Computer audio has delivered audio, or this session doesn't capture it.
+    var systemIsLive: Bool { !sessionIsCallCapture || systemCapture.hasAudio }
+    /// macOS stopped the call-audio stream during this session and it
+    /// hasn't come back yet.
+    private(set) var systemAudioStopped = false
+    /// Trying to bring the call audio back (true only while stopped).
+    private(set) var systemAudioReconnecting = false
+    private var systemRestartTask: Task<Void, Never>?
+    /// The call-audio pipeline is consuming the capture stream, so a
+    /// reconnect has somewhere to deliver.
+    private var systemConsumerAttached = false
+    /// A loss notice for this recording that arrived before the pipeline
+    /// attached; handled as soon as it does.
+    private var pendingSystemStop: (error: any Error, generation: Int)?
+    /// Waits before each reconnect attempt: about a minute in all.
+    private static let systemRestartDelays: [Duration] = [.seconds(1), .seconds(2), .seconds(4), .seconds(8), .seconds(15)]
+    /// How long a new stream gets to deliver before the next attempt.
+    private static let systemFirstSampleDeadline: Duration = .seconds(5)
+
+    /// True while start() is still setting up. stop() waits for it, so a
+    /// quick Start-then-Stop can't leave half a session running.
+    private var isStarting = false
+
     // GrembleVoice engines
     private let modelManager: ParakeetModelManager
     private var asrEngine: ParakeetStreamingEngine?
@@ -106,6 +132,35 @@ final class TranscriptionEngine {
     private var diarUpdateTask: Task<Void, Never>?
     /// Keeps the mic stream alive for the audio level meter when transcription isn't running.
     private var micKeepAliveTask: Task<Void, Never>?
+    private var micWatchdogTask: Task<Void, Never>?
+
+    /// What the mic is doing, for the toolbar. Kept apart from lastError.
+    enum MicStatus { case starting, live, reconnecting, lost }
+    private(set) var micStatus: MicStatus = .starting
+    private static let micLostMessage = "Your microphone stopped and couldn't be reconnected, so your side isn't being recorded. Stop and start again, or check the input in System Settings."
+    private static let callAudioReconnectingMessage = "Computer audio stopped, so the other side isn't being recorded. Reconnecting…"
+    private static let callAudioLostMessage = "Computer audio stopped and couldn't be reconnected, so the other side isn't being recorded. Stop and start again."
+    private static let bothLostMessage = "Neither side is being recorded: computer audio stopped and the microphone couldn't be reconnected. Stop and start again."
+    private static var lossMessages: [String] { [micLostMessage, callAudioReconnectingMessage, callAudioLostMessage, bothLostMessage] }
+
+    /// Sets the loss message from the current state of both sides, so it
+    /// never reassures about a side that's also gone. Leaves other errors
+    /// (e.g. screen-recording instructions) alone.
+    private func refreshLossMessage() {
+        guard lastError == nil || Self.lossMessages.contains(lastError ?? "") else { return }
+        switch (systemAudioStopped, micStatus == .lost) {
+        case (true, true): lastError = Self.bothLostMessage
+        case (true, false):
+            lastError = systemAudioReconnecting ? Self.callAudioReconnectingMessage : Self.callAudioLostMessage
+        case (false, true): lastError = Self.micLostMessage
+        case (false, false): lastError = nil
+        }
+    }
+    /// When the current mic open began (Start, device change or retry).
+    private var micAttemptStartedAt: Date?
+    /// How long an open may take before its first buffer: direct path
+    /// (2 s) plus the engine fallback (about 6-7 s with a headset).
+    private static let micFirstBufferDeadline: TimeInterval = 12
     private var deviceRestartTask: Task<Void, Never>?
 
     // Diarization state — updated from diarization update stream, read during attribution
@@ -196,16 +251,24 @@ final class TranscriptionEngine {
         }
     }
 
-    func start(locale: Locale, inputDeviceID: AudioDeviceID = 0, appBundleID: String? = nil, micOnly: Bool = false, preferBuiltInMic: Bool = true, vocabularyCorrector: VocabularyCorrector? = nil) async {
+    /// Returns false if the session didn't start (lastError says why), so
+    /// the caller can close the note and let Start be pressed again.
+    @discardableResult
+    /// `systemAudioPath` is where the call audio is kept for the speaker
+    /// pass; the recording's recovery record already names it.
+    func start(locale: Locale, inputDeviceID: AudioDeviceID = 0, appBundleID: String? = nil, micOnly: Bool = false, preferBuiltInMic: Bool = true, vocabularyCorrector: VocabularyCorrector? = nil, systemAudioPath: URL? = nil) async -> Bool {
         engineLog("[ENGINE-0] start() called, isRunning=\(isRunning)")
-        guard !isRunning else { return }
+        guard !isRunning, !isStarting else { return false }
+        isStarting = true
+        defer { isStarting = false }
         lastError = nil
         preferBuiltInMicDuringCalls = preferBuiltInMic
         sessionIsCallCapture = !micOnly
 
-        guard await ensureMicrophonePermission() else { return }
+        guard await ensureMicrophonePermission() else { return false }
 
         isRunning = true
+        let startedAt = Date()
         self.corrector = vocabularyCorrector
         if let c = vocabularyCorrector {
             engineLog("[ENGINE-VOCAB] Corrector: \(c.termCount) terms, \(c.correctionCount) corrections")
@@ -252,11 +315,14 @@ final class TranscriptionEngine {
                 lastError = msg
                 assetStatus = "Ready"
                 isRunning = false
-                return
+                return false
             }
         }
 
-        guard let asrEngine else { return }
+        guard let asrEngine else {
+            isRunning = false
+            return false
+        }
 
         // 2. Start mic capture
         userSelectedDeviceID = inputDeviceID
@@ -264,12 +330,19 @@ final class TranscriptionEngine {
         let micDeviceParam = resolved.param
         currentMicDeviceID = resolved.tracked
         engineLog("[ENGINE-3] starting mic capture, deviceParam=\(String(describing: micDeviceParam)) tracked=\(currentMicDeviceID)")
+        micStatus = .starting
+        micAttemptStartedAt = Date()
         let micStream = micCapture.bufferStream(deviceID: micDeviceParam)
         if let captureError = micCapture.captureError {
             lastError = captureError
         }
 
         // 3. Start system audio capture (skipped for mic-only mode)
+        systemAudioStopped = false
+        pendingSystemStop = nil
+        systemCapture.setOnStreamStopped { [weak self] generation, error in
+            Task { @MainActor in self?.systemStreamStopped(error, generation: generation) }
+        }
         engineLog("[ENGINE-4] starting system audio capture...")
         let sysStreams: SystemAudioCapture.CaptureStreams?
         if micOnly {
@@ -282,6 +355,11 @@ final class TranscriptionEngine {
         } else {
             do {
                 sysStreams = try await systemCapture.bufferStream(appBundleID: appBundleID)
+                systemConsumerAttached = true
+                if let pending = pendingSystemStop {
+                    pendingSystemStop = nil
+                    systemStreamStopped(pending.error, generation: pending.generation)
+                }
                 engineLog("[ENGINE-5] system audio capture started OK")
             } catch {
                 let msg = "Failed to start system audio: \(error.localizedDescription)"
@@ -293,6 +371,7 @@ final class TranscriptionEngine {
 
         // 4. Start mic transcription pipeline (VADProcessor — no timing needed)
         let store = transcriptStore
+        let storeSession = transcriptStore.session
         do {
             let micVadManager = try await modelManager.makeVadManager()
             let micVad = VADProcessor(vadManager: micVadManager)
@@ -337,7 +416,7 @@ final class TranscriptionEngine {
                     let confidence = result.confidence
                     Task { @MainActor in
                         store.volatileYouText = ""
-                        store.append(Utterance(text: text, speaker: .you, speakerName: "You", confidence: confidence))
+                        store.append(Utterance(text: text, speaker: .you, speakerName: "You", confidence: confidence), session: storeSession)
                     }
                 }
                 if hadFatalError {
@@ -370,10 +449,9 @@ final class TranscriptionEngine {
 
             // Create temp audio file for post-session batch diarization
             if offlineDiarEngine != nil {
-                let cachesDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
-                    .appendingPathComponent("io.gremble.detto/audio-sessions", isDirectory: true)
-                try? FileManager.default.createDirectory(at: cachesDir, withIntermediateDirectories: true)
-                let audioPath = cachesDir.appendingPathComponent("\(UUID().uuidString).raw")
+                let audioPath = systemAudioPath
+                    ?? AppPaths.audioSessions.appendingPathComponent("\(UUID().uuidString).raw")
+                try? FileManager.default.createDirectory(at: audioPath.deletingLastPathComponent(), withIntermediateDirectories: true)
                 FileManager.default.createFile(atPath: audioPath.path, contents: nil)
                 sysAudioFilePath = audioPath
                 sysAudioFileHandle = try? FileHandle(forWritingTo: audioPath)
@@ -454,7 +532,7 @@ final class TranscriptionEngine {
                                             speechSamples.removeAll(keepingCapacity: true)
                                             await Self.transcribeAndAttribute(
                                                 segment: segment, startTime: startT, endTime: endT,
-                                                asr: asr, store: store, engine: self,
+                                                asr: asr, store: store, storeSession: storeSession, engine: self,
                                                 diarAvailable: diarAvailable,
                                                 corrector: sysVocabCorrector
                                             )
@@ -476,7 +554,7 @@ final class TranscriptionEngine {
                                         speechStartOffset = totalSampleOffset
                                         await Self.transcribeAndAttribute(
                                             segment: segment, startTime: startT, endTime: endT,
-                                            asr: asr, store: store, engine: self,
+                                            asr: asr, store: store, storeSession: storeSession, engine: self,
                                             diarAvailable: diarAvailable,
                                             corrector: sysVocabCorrector
                                         )
@@ -500,7 +578,7 @@ final class TranscriptionEngine {
                         let endT = TimeInterval(totalSampleOffset) / 16000.0
                         await Self.transcribeAndAttribute(
                             segment: speechSamples, startTime: startT, endTime: endT,
-                            asr: asr, store: store, engine: self,
+                            asr: asr, store: store, storeSession: storeSession, engine: self,
                             diarAvailable: diarAvailable,
                             corrector: sysVocabCorrector
                         )
@@ -508,18 +586,99 @@ final class TranscriptionEngine {
                 }
             } catch {
                 engineLog("[ENGINE-5c-FAIL] System VAD setup failed: \(error.localizedDescription)")
+                systemConsumerAttached = false
                 lastError = "System audio setup failed: \(error.localizedDescription)"
             }
         }
 
         assetStatus = "Transcribing (Parakeet-TDT v3)"
-        engineLog("[ENGINE-6] all transcription tasks started")
+        engineLog("[ENGINE-6] all transcription tasks started (\(Int(Date().timeIntervalSince(startedAt) * 1000))ms)")
+        watchFirstAudio(since: startedAt)
 
         installDefaultDeviceListener()
+        startMicWatchdog()
+        return true
+    }
+
+    /// macOS ended the call-audio stream. Drop LIVE, say so and try to
+    /// bring it back; the mic keeps recording.
+    private func systemStreamStopped(_ error: any Error, generation: Int) {
+        guard isRunning, sessionIsCallCapture else { return }
+        // A late notice from a recording that has since been stopped.
+        guard generation == systemCapture.generation else {
+            engineLog("[ENGINE-SYS-LOST] ignored a stop notice from an earlier recording")
+            return
+        }
+        // The first stream died before start() attached the pipeline:
+        // keep the notice and handle it once it attaches.
+        guard systemConsumerAttached else {
+            engineLog("[ENGINE-SYS-LOST] stop notice before the pipeline attached; handling it once it does")
+            pendingSystemStop = (error, generation)
+            return
+        }
+        engineLog("[ENGINE-SYS-LOST] call audio stream stopped: \(error.localizedDescription)")
+        systemAudioStopped = true
+        // A replacement that stops again is handled by the attempt loop.
+        if systemRestartTask == nil {
+            systemAudioReconnecting = true
+            startSystemRestart()
+        }
+        refreshLossMessage()
+    }
+
+    /// Reopens the call audio with the same filter, feeding the same
+    /// pipeline (SystemAudioCapture fills the gap with silence). Each
+    /// attempt waits a bit longer; a new stream counts once it delivers.
+    /// Stop cancels it, and SystemAudioCapture drops a stream that opens
+    /// after Stop.
+    private func startSystemRestart() {
+        systemRestartTask = Task { [weak self] in
+            for (index, delay) in Self.systemRestartDelays.enumerated() {
+                let attempt = index + 1
+                try? await Task.sleep(for: delay)
+                guard let self, self.isRunning, !Task.isCancelled else { return }
+                engineLog("[ENGINE-SYS-RESTART] reconnecting call audio, attempt \(attempt)")
+                do {
+                    guard try await self.systemCapture.restart() else { return }
+                } catch {
+                    engineLog("[ENGINE-SYS-RESTART] attempt \(attempt) failed: \(error.localizedDescription)")
+                    continue
+                }
+                let deadline = ContinuousClock.now + Self.systemFirstSampleDeadline
+                var live = false
+                while !live, ContinuousClock.now < deadline {
+                    try? await Task.sleep(for: .milliseconds(200))
+                    guard self.isRunning, !Task.isCancelled else { return }
+                    live = self.systemCapture.hasAudio
+                }
+                // Missed the deadline: close it, so it can't come alive
+                // behind the next attempt or after giving up. If it went
+                // live at the last moment, keep it.
+                if !live {
+                    live = await self.systemCapture.closeReplacementIfSilent()
+                    guard self.isRunning, !Task.isCancelled else { return }
+                }
+                if live {
+                    engineLog("[ENGINE-SYS-RESTART] call audio is back (attempt \(attempt))")
+                    self.systemRestartTask = nil
+                    self.systemAudioReconnecting = false
+                    self.systemAudioStopped = false
+                    self.refreshLossMessage()
+                    return
+                }
+                engineLog("[ENGINE-SYS-RESTART] attempt \(attempt): no audio within \(Self.systemFirstSampleDeadline), closed it")
+            }
+            guard let self, self.isRunning, !Task.isCancelled else { return }
+            engineLog("[ENGINE-SYS-RESTART] giving up after \(Self.systemRestartDelays.count) attempts")
+            self.systemRestartTask = nil
+            self.systemAudioReconnecting = false
+            self.refreshLossMessage()
+        }
     }
 
     /// Restart only the mic capture with a new device, keeping system audio and models intact.
-    func restartMic(inputDeviceID: AudioDeviceID) {
+    /// `force` restarts even on the same device (to recover a stalled mic).
+    func restartMic(inputDeviceID: AudioDeviceID, force: Bool = false) {
         guard isRunning, let asrEngine else { return }
 
         if inputDeviceID != 0 || userSelectedDeviceID != 0 {
@@ -527,7 +686,7 @@ final class TranscriptionEngine {
         }
         let resolved = resolveMicDevice(userSelected: inputDeviceID)
         let resolvedMicID = resolved.tracked
-        guard resolvedMicID != currentMicDeviceID else {
+        guard force || resolvedMicID != currentMicDeviceID else {
             engineLog("[ENGINE-MIC-SWAP] same device \(resolvedMicID), skipping")
             return
         }
@@ -541,6 +700,8 @@ final class TranscriptionEngine {
         micCapture.stop()
 
         currentMicDeviceID = resolvedMicID
+        micAttemptStartedAt = Date()
+        if micStatus == .live { micStatus = .reconnecting }
 
         let micDeviceParam = resolved.param
         let micStream = micCapture.bufferStream(deviceID: micDeviceParam)
@@ -548,6 +709,7 @@ final class TranscriptionEngine {
             lastError = captureError
         }
         let store = transcriptStore
+        let storeSession = transcriptStore.session
         let asr = asrEngine
         let micResampler = AudioBufferResampler()
 
@@ -588,7 +750,7 @@ final class TranscriptionEngine {
                     let confidence = result.confidence
                     Task { @MainActor in
                         store.volatileYouText = ""
-                        store.append(Utterance(text: text, speaker: .you, speakerName: "You", confidence: confidence))
+                        store.append(Utterance(text: text, speaker: .you, speakerName: "You", confidence: confidence), session: storeSession)
                     }
                 }
                 if hadFatalError {
@@ -597,14 +759,8 @@ final class TranscriptionEngine {
             }
         }
 
+        // The mic watchdog follows this attempt (micAttemptStartedAt).
         engineLog("[ENGINE-MIC-SWAP] mic restarted on device \(resolvedMicID)")
-
-        Task {
-            try? await Task.sleep(for: .seconds(3))
-            guard self.isRunning, !self.micCapture.tapIsActive else { return }
-            engineLog("[ENGINE-MIC-WATCHDOG] No mic activity 3s after restart")
-            self.lastError = "Microphone disconnected. System audio continues."
-        }
     }
 
     // MARK: - Speaker Attribution
@@ -615,6 +771,7 @@ final class TranscriptionEngine {
         endTime: TimeInterval,
         asr: ParakeetStreamingEngine,
         store: TranscriptStore,
+        storeSession: Int,
         engine: TranscriptionEngine?,
         diarAvailable: Bool,
         corrector: VocabularyCorrector? = nil
@@ -670,7 +827,7 @@ final class TranscriptionEngine {
         let confidence = result.confidence
         Task { @MainActor in
             store.volatileThemText = ""
-            store.append(Utterance(text: text, speaker: .them, speakerName: speakerName, confidence: confidence))
+            store.append(Utterance(text: text, speaker: .them, speakerName: speakerName, confidence: confidence), session: storeSession)
         }
     }
 
@@ -760,18 +917,122 @@ final class TranscriptionEngine {
         }
     }
 
+    /// Logs when each side first delivers audio, and says so on screen if
+    /// one hasn't after 10 s (the mic opens asynchronously, so its errors
+    /// show up here rather than at start).
+    private func watchFirstAudio(since startedAt: Date) {
+        Task { [weak self] in
+            var micLogged = false
+            var sysLogged = false
+            for _ in 0..<100 {
+                guard let self, self.isRunning else { return }
+                let elapsed = Int(Date().timeIntervalSince(startedAt) * 1000)
+                if !micLogged, self.micIsLive {
+                    engineLog("[ENGINE-LIVE] mic audio flowing (\(elapsed)ms after start)")
+                    micLogged = true
+                }
+                if !sysLogged, self.sessionIsCallCapture, self.systemCapture.hasAudio {
+                    engineLog("[ENGINE-LIVE] system audio flowing (\(elapsed)ms after start)")
+                    sysLogged = true
+                }
+                if micLogged, sysLogged || !self.sessionIsCallCapture { return }
+                try? await Task.sleep(for: .milliseconds(100))
+            }
+            guard let self, self.isRunning else { return }
+            if !self.micIsLive {
+                // The toolbar shows the mic's state; the watchdog retries.
+                let detail = self.micCapture.captureError.map { " (\($0))" } ?? ""
+                engineLog("[ENGINE-LIVE-WARN] no mic audio 10s after start\(detail)")
+            } else if !self.systemIsLive, self.lastError == nil {
+                engineLog("[ENGINE-LIVE-WARN] no system audio 10s after start")
+                self.lastError = "Computer audio isn't coming through yet."
+            }
+        }
+    }
+
+    /// Watches the mic for the whole session and drives `micStatus`.
+    ///
+    /// Every mic (re)open is one attempt, whoever started it (Start, a
+    /// device change, a retry); `restartMic` stamps `micAttemptStartedAt`.
+    /// An attempt that hasn't delivered gets `micFirstBufferDeadline` to do
+    /// so (the fallback path alone can take ~7 s with a headset); a mic that
+    /// had delivered and then went quiet for 3 s is stalled. Either way it
+    /// retries, up to 3 times, then shows MIC LOST. Audio coming back resets
+    /// everything. Doesn't touch `lastError`, so other instructions (e.g.
+    /// screen recording) stay visible.
+    private func startMicWatchdog() {
+        micWatchdogTask?.cancel()
+        micWatchdogTask = Task { [weak self] in
+            var retries = 0
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(1))
+                guard let self, self.isRunning, !Task.isCancelled else { return }
+                let mic = self.micCapture
+                if mic.tapIsActive {
+                    if self.micStatus != .live {
+                        if retries > 0 || self.micStatus == .lost {
+                            engineLog("[ENGINE-MIC-WATCH] mic audio is back")
+                        }
+                        self.micStatus = .live
+                        retries = 0
+                        self.refreshLossMessage()
+                    }
+                    continue
+                }
+                let attemptAge = self.micAttemptStartedAt.map { Date().timeIntervalSince($0) } ?? 0
+                let failed: Bool
+                if mic.hasDelivered {
+                    failed = (mic.secondsSinceLastBuffer ?? 0) >= 3
+                } else {
+                    // A device change or retry is opening the mic.
+                    if self.micStatus == .live { self.micStatus = .reconnecting }
+                    failed = attemptAge >= Self.micFirstBufferDeadline
+                }
+                guard failed, self.micStatus != .lost else { continue }
+                guard retries < 3 else {
+                    engineLog("[ENGINE-MIC-WATCH] giving up after \(retries) reconnects")
+                    self.micStatus = .lost
+                    // Explain it, unless another instruction is showing.
+                    self.refreshLossMessage()
+                    continue
+                }
+                retries += 1
+                let age = mic.secondsSinceLastBuffer.map { String(format: "%.1fs", $0) } ?? "never"
+                engineLog("[ENGINE-MIC-WATCH] no mic audio (last buffer \(age) ago, attempt \(Int(attemptAge))s old\(mic.captureError.map { ", \($0)" } ?? "")); reconnecting, retry \(retries)")
+                self.micStatus = .reconnecting
+                self.restartMic(inputDeviceID: self.userSelectedDeviceID, force: true)
+            }
+        }
+    }
+
     func stop() async {
         engineLog("[ENGINE-STOP] stop() called, cancelling all tasks")
+        while isStarting {
+            try? await Task.sleep(for: .milliseconds(50))
+        }
         isRunning = false
 
+        systemCapture.setOnStreamStopped(nil)
+        systemRestartTask?.cancel()
+        systemRestartTask = nil
+        systemAudioReconnecting = false
+        systemConsumerAttached = false
+        pendingSystemStop = nil
         await systemCapture.stop()
-        micCapture.stop()
+        // Wait for the mic to actually stop (and cancel a setup still
+        // opening the device), so nothing turns it on after Stop finishes.
+        await micCapture.stopAndWait()
+        systemAudioStopped = false
 
         micReaderTask?.cancel()
         micTranscribeTask?.cancel()
         sysLoopTask?.cancel()
         diarUpdateTask?.cancel()
         micKeepAliveTask?.cancel()
+        micWatchdogTask?.cancel()
+        micWatchdogTask = nil
+        micAttemptStartedAt = nil
+        micStatus = .starting
         micReaderTask = nil
         micTranscribeTask = nil
         sysLoopTask = nil
@@ -797,17 +1058,15 @@ final class TranscriptionEngine {
 
     // MARK: - Post-session batch diarization
 
+    /// Relabels the other side's speakers from the recording's audio. The
+    /// audio is kept; call `discardSessionAudio()` once the note is saved.
     func runOfflineDiarization() async {
         guard let audioPath = sysAudioFilePath else { return }
-        guard let engine = offlineDiarEngine, await engine.isReady else {
-            cleanupTempAudio()
-            return
-        }
+        guard let engine = offlineDiarEngine, await engine.isReady else { return }
 
         let hasRemoteUtterances = transcriptStore.utterances.contains { $0.speaker == .them }
         if !hasRemoteUtterances {
             engineLog("[OFFLINE-DIAR] Skipping batch pass (no remote utterances)")
-            cleanupTempAudio()
             return
         }
 
@@ -825,8 +1084,6 @@ final class TranscriptionEngine {
         } catch {
             engineLog("[OFFLINE-DIAR] Batch pass failed: \(error.localizedDescription)")
         }
-
-        cleanupTempAudio()
     }
 
     private func applyOfflineSpeakerLabels(_ segments: [DiarizationEngine.Segment]) {
@@ -864,7 +1121,15 @@ final class TranscriptionEngine {
         return 0
     }
 
-    private func cleanupTempAudio() {
+    /// The note couldn't be saved: let go of the audio without deleting
+    /// it. Its recovery record keeps it until the note is recovered.
+    func keepSessionAudioForRecovery() {
+        sysAudioFilePath = nil
+        sessionStartTime = nil
+    }
+
+    /// Deletes the recording's temp audio. Call after its note is saved.
+    func discardSessionAudio() {
         if let path = sysAudioFilePath {
             try? FileManager.default.removeItem(at: path)
         }
@@ -872,11 +1137,16 @@ final class TranscriptionEngine {
         sessionStartTime = nil
     }
 
-    static func cleanupOrphanedAudioFiles() {
-        let cachesDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
-            .appendingPathComponent("io.gremble.detto/audio-sessions", isDirectory: true)
-        guard let files = try? FileManager.default.contentsOfDirectory(at: cachesDir, includingPropertiesForKeys: nil) else { return }
+    /// Deletes temp audio left by recordings that ended without a save.
+    /// Only files created before `cutoff` (this launch), so a recording
+    /// started meanwhile keeps its audio, and never audio an unsaved
+    /// note's recovery record still holds.
+    static func cleanupOrphanedAudioFiles(createdBefore cutoff: Date, keeping keptNames: Set<String>) {
+        let cachesDir = AppPaths.audioSessions
+        guard let files = try? FileManager.default.contentsOfDirectory(at: cachesDir, includingPropertiesForKeys: [.creationDateKey]) else { return }
         for file in files {
+            let created = (try? file.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast
+            guard created < cutoff, !keptNames.contains(file.lastPathComponent) else { continue }
             try? FileManager.default.removeItem(at: file)
         }
     }

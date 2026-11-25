@@ -3,6 +3,8 @@ import SwiftUI
 struct BriefingPanelView: View {
     let selectedClient: ClientInfo?
     let isRecording: Bool
+    var isSaving: Bool = false
+    var isStarting: Bool = false
     let silenceSeconds: Int
     @Binding var editableContext: String
     @Binding var genericAttendees: String
@@ -187,6 +189,10 @@ struct BriefingPanelView: View {
 
     private var actionButtons: some View {
         VStack(spacing: 8) {
+            if isSaving {
+                SavingNotice()
+            }
+
             Button(action: onStartCallCapture) {
                 HStack(spacing: 8) {
                     Text("START CALL CAPTURE")
@@ -223,6 +229,8 @@ struct BriefingPanelView: View {
             }
             .buttonStyle(.plain)
         }
+        .disabled(isSaving || isStarting)
+        .opacity(isSaving ? 0.5 : 1)
         .padding(.horizontal, 12)
         .padding(.bottom, 10)
     }

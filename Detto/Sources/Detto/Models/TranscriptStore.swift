@@ -11,9 +11,23 @@ final class TranscriptStore {
     /// Timestamp of the most recent finalized utterance
     private(set) var lastUtteranceTimestamp: Date?
 
+    /// Changes on every clear(). Transcription tasks capture it when a
+    /// recording starts, so a late result from an old recording can't land
+    /// in the next one.
+    private(set) var session = 0
+
     func append(_ utterance: Utterance) {
         utterances.append(utterance)
         lastUtteranceTimestamp = utterance.timestamp
+    }
+
+    /// Appends only if the store still holds the recording `session` came from.
+    func append(_ utterance: Utterance, session: Int) {
+        guard session == self.session else {
+            engineLog("[STORE] dropped a late utterance from an earlier recording")
+            return
+        }
+        append(utterance)
     }
 
     func updateSpeakerName(at index: Int, name: String) {
@@ -27,6 +41,7 @@ final class TranscriptStore {
     }
 
     func clear() {
+        session += 1
         utterances.removeAll()
         volatileYouText = ""
         volatileThemText = ""

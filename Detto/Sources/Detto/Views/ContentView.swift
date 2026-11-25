@@ -30,10 +30,28 @@ struct ContentView: View {
     @State private var showOnboarding = false
     @State private var audioLevel: Float = 0
     @State private var activeSessionType: SessionType?
+    /// True from Stop until the stopped session's note is fully written.
+    /// Starting a new session meanwhile would clear the transcript the old
+    /// one is still saving, leaving an empty note (Nov 4).
+    @State private var isSaving = false
+    /// True from Start until the engine has finished setting up. Set
+    /// synchronously, before the transcript is touched, so a second Start
+    /// (or a shortcut during recording) can't clear the live transcript.
+    @State private var isStarting = false
+    /// The in-flight start, so Stop can wait for it before saving.
+    @State private var startTask: Task<Void, Never>?
+    /// Stop arrived before the engine started; the start skips capture.
+    @State private var stopRequestedDuringStart = false
+    /// Whether each side of the recording is actually delivering audio.
+    /// Polled from the engine with the level meter.
+    @State private var micIsLive = false
+    @State private var systemIsLive = false
     @State private var activeClient: ClientInfo?
     @State private var detectedAppName: String?
     @State private var silenceSeconds: Int = 0
     @State private var savedFileURL: URL?
+    /// The banner's note was recovered at launch, not saved just now.
+    @State private var savedFileWasRecovered = false
     @State private var sessionElapsed: Int = 0
     @State private var editableContext: String = ""
     @State private var genericAttendees: String = ""
@@ -71,8 +89,23 @@ struct ContentView: View {
             if !hasCompletedOnboarding {
                 showOnboarding = true
             }
+            // Before anything awaits, so Start always finds a recorder.
             if transcriptionEngine == nil {
                 transcriptionEngine = TranscriptionEngine(transcriptStore: transcriptStore, modelManager: asrManager)
+            }
+            let recovery = await LaunchRecovery.runOnce()
+            let idle = activeSessionType == nil && !isStarting && !isSaving
+            if let last = recovery.recovered.last, savedFileURL == nil, idle {
+                savedFileWasRecovered = true
+                savedFileURL = last
+            }
+            if let unsure = recovery.needsManualCheck.first, idle, transcriptionEngine?.lastError == nil {
+                engineLog("[RECOVER] needs a manual check: \(recovery.needsManualCheck.map(\.path))")
+                transcriptionEngine?.lastError = "\(AppPaths.displayName) left \(unsure.lastPathComponent) untouched because it couldn't confirm it was the unfinished recording. Check that note by hand."
+            } else if recovery.failed > 0, idle, transcriptionEngine?.lastError == nil {
+                transcriptionEngine?.lastError = recovery.failed == 1
+                    ? "A note from an earlier recording couldn't be finished. \(AppPaths.displayName) will try again next time it opens."
+                    : "\(recovery.failed) notes from earlier recordings couldn't be finished. \(AppPaths.displayName) will try again next time it opens."
             }
             dictationController.isMeetingActive = { [weak transcriptionEngine] in
                 transcriptionEngine?.isRunning ?? false
@@ -113,6 +146,10 @@ struct ContentView: View {
                     if audioLevel != 0 { audioLevel = 0 }
                     continue
                 }
+                let mic = engine.isRunning && engine.micIsLive
+                let system = engine.isRunning && engine.systemIsLive
+                if mic != micIsLive { micIsLive = mic }
+                if system != systemIsLive { systemIsLive = system }
                 if engine.isRunning {
                     let newLevel = engine.audioLevel
                     if abs(newLevel - audioLevel) > 0.005 { audioLevel = newLevel }
@@ -299,9 +336,20 @@ struct ContentView: View {
                     saveBanner(url: url)
                 }
 
+                // A failed Start (e.g. mic permission) lands back here; keep
+                // its instructions visible.
+                if let error = transcriptionEngine?.lastError {
+                    Text(error).font(.dMono(size: 10, weight: .medium)).foregroundStyle(Color.dRed)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.horizontal, 14).padding(.vertical, 6)
+                }
+
                 BriefingPanelView(
                     selectedClient: activeClient ?? clientRegistry.selectedClient,
                     isRecording: false,
+                    isSaving: isSaving,
+                    isStarting: isStarting,
                     silenceSeconds: silenceSeconds,
                     editableContext: $editableContext,
                     genericAttendees: $genericAttendees,
@@ -388,6 +436,8 @@ struct ContentView: View {
                 silenceSeconds: silenceSeconds,
                 statusMessage: transcriptionEngine?.assetStatus,
                 errorMessage: transcriptionEngine?.lastError,
+                isSaving: isSaving,
+                isStarting: isStarting,
                 onStartCallCapture: { startSession(type: .callCapture) },
                 onStartVoiceMemo: { startSession(type: .voiceMemo) },
                 onStop: stopSession
@@ -401,6 +451,13 @@ struct ContentView: View {
     private var dettoToolbar: some View {
         HStack(spacing: 0) {
             DettoWordmark(size: 18)
+            if let forkLabel = AppPaths.forkLabel {
+                Text(forkLabel)
+                    .font(.dMono(size: 10, weight: .bold))
+                    .tracking(1)
+                    .foregroundStyle(Color.dDim)
+                    .padding(.leading, 8)
+            }
 
             Spacer()
 
@@ -422,7 +479,7 @@ struct ContentView: View {
                         .font(.dMono(size: 11, weight: .semibold).monospacedDigit())
                         .foregroundStyle(Color.dText)
 
-                    PulsingDot(size: 6)
+                    liveIndicator
                 } else {
                     Text("ON-DEVICE")
                         .font(.dMono(size: 9, weight: .bold))
@@ -438,6 +495,96 @@ struct ContentView: View {
         .padding(.horizontal, 16)
         .frame(height: 44)
         .background(Color.dSurface)
+    }
+
+    // MARK: - Live Indicator
+
+    /// "LIVE" only once audio is actually arriving from every side this
+    /// session records. Until then, says what it's waiting for.
+    @ViewBuilder
+    private var liveIndicator: some View {
+        if transcriptionEngine?.systemAudioStopped == true, !micIsLive {
+            // Neither side is being recorded right now.
+            HStack(spacing: 6) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(Color.dRed)
+                Text("BOTH SIDES LOST")
+                    .font(.dMono(size: 9, weight: .bold))
+                    .tracking(1)
+                    .foregroundStyle(Color.dRed)
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("Both sides lost. Neither you nor the other side is being recorded.")
+        } else if transcriptionEngine?.systemAudioStopped == true {
+            // Lost beats LIVE and STARTING: the other side isn't recorded.
+            // Red even while reconnecting, because nothing is recorded yet.
+            let reconnecting = transcriptionEngine?.systemAudioReconnecting == true
+            HStack(spacing: 6) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(Color.dRed)
+                Text(reconnecting ? "RECONNECTING CALL AUDIO" : "CALL AUDIO LOST")
+                    .font(.dMono(size: 9, weight: .bold))
+                    .tracking(1)
+                    .foregroundStyle(Color.dRed)
+                if reconnecting {
+                    ProgressView()
+                        .controlSize(.mini)
+                        .tint(Color.dRed)
+                }
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(reconnecting
+                ? "Call audio lost. Reconnecting. The other side isn't being recorded until it's back."
+                : "Call audio lost. The other side isn't being recorded. Stop and start again.")
+        } else if !micIsLive, transcriptionEngine?.micStatus == .lost {
+            // Retries are exhausted: no spinner, nothing is in progress.
+            HStack(spacing: 6) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(Color.dRed)
+                Text("MIC LOST")
+                    .font(.dMono(size: 9, weight: .bold))
+                    .tracking(1)
+                    .foregroundStyle(Color.dRed)
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("Microphone lost. Your side isn't being recorded. Stop and start again, or check the input in System Settings.")
+            .help("Your side isn't being recorded. Stop and start again, or check the input in System Settings.")
+        } else if micIsLive && systemIsLive {
+            HStack(spacing: 6) {
+                Text("LIVE")
+                    .font(.dMono(size: 9, weight: .bold))
+                    .tracking(1)
+                    .foregroundStyle(Color.dRed)
+                PulsingDot(size: 6)
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("Recording is live")
+        } else {
+            HStack(spacing: 6) {
+                Text(waitingLabel)
+                    .font(.dMono(size: 9, weight: .bold))
+                    .tracking(1)
+                    .foregroundStyle(Color.dAmber)
+                ProgressView()
+                    .controlSize(.mini)
+                    .tint(Color.dAmber)
+            }
+            .accessibilityElement(children: .combine)
+        }
+    }
+
+    private var waitingLabel: String {
+        if !micIsLive {
+            switch transcriptionEngine?.micStatus {
+            case .reconnecting: return "RECONNECTING MIC"
+            case .lost: return "MIC LOST"
+            default: return systemIsLive ? "WAITING FOR MIC" : "STARTING"
+            }
+        }
+        return "WAITING FOR CALL AUDIO"
     }
 
     // MARK: - Empty State
@@ -470,7 +617,7 @@ struct ContentView: View {
                         .font(.system(size: 8, weight: .bold))
                         .foregroundStyle(Color.dGreen)
                 )
-            Text("Saved to \(url.lastPathComponent)")
+            Text(savedFileWasRecovered ? "Recovered \(url.lastPathComponent)" : "Saved to \(url.lastPathComponent)")
                 .font(.dMono(size: 11, weight: .bold))
                 .foregroundStyle(Color.dText)
                 .lineLimit(1)
@@ -497,6 +644,23 @@ struct ContentView: View {
         transcriptionEngine?.isRunning ?? false
     }
 
+    /// One recording at a time: Start is accepted only when nothing is
+    /// starting, recording or saving.
+    private var canStart: Bool {
+        !isStarting && !isRunning && !isSaving && activeSessionType == nil
+    }
+
+    /// Returns true (and beeps) if a recording is already starting,
+    /// running or saving.
+    private func rejectStartIfBusy() -> Bool {
+        guard canStart else {
+            engineLog("[SESSION-GUARD] start ignored: starting=\(isStarting) running=\(isRunning) saving=\(isSaving) active=\(activeSessionType != nil)")
+            NSSound.beep()
+            return true
+        }
+        return false
+    }
+
     private func formatTime(_ s: Int) -> String {
         "\(s / 60):\(String(format: "%02d", s % 60))"
     }
@@ -505,6 +669,9 @@ struct ContentView: View {
 
     /// Start a client-specific recording. Captures frontmost app synchronously before async work.
     private func startClientRecording() {
+        if rejectStartIfBusy() { return }
+        isStarting = true
+        stopRequestedDuringStart = false
         let client = clientRegistry.selectedClient
         activeClient = client
         savedFileURL = nil
@@ -527,7 +694,8 @@ struct ContentView: View {
         let sourceApp = appName ?? "Call"
         let preCallNotes = editableContext
 
-        Task {
+        startTask = Task {
+            defer { isStarting = false }
             transcriptionEngine?.lastError = nil
             await sessionStore.startSession()
             do {
@@ -546,25 +714,47 @@ struct ContentView: View {
             if !preCallNotes.isEmpty {
                 await transcriptLogger.updateContext(preCallNotes)
             }
+            // Stop was pressed while the note was being created: don't
+            // start capture. Stop saves the (empty) note.
+            guard !stopRequestedDuringStart else { return }
             activeSessionType = .callCapture
             detectedAppName = appName
             let corrector = buildVocabularyCorrector(client: client)
-            await transcriptionEngine?.start(
+            let started = await transcriptionEngine?.start(
                 locale: settings.locale,
                 inputDeviceID: settings.inputDeviceID,
                 appBundleID: appName != nil ? bundleID : nil,
                 preferBuiltInMic: settings.preferBuiltInMicDuringCalls,
-                vocabularyCorrector: corrector
-            )
+                vocabularyCorrector: corrector,
+                systemAudioPath: await transcriptLogger.currentAudioPath
+            ) ?? false
+            if !started { await abandonFailedStart() }
         }
     }
 
+    /// The engine refused to start (mic permission, models, ...). Close the
+    /// note it never wrote to and go back to idle, so Start works again.
+    /// The engine's error stays on screen.
+    private func abandonFailedStart() async {
+        // Stop already took over and will clean up.
+        guard !stopRequestedDuringStart else { return }
+        engineLog("[SESSION-GUARD] start failed; back to idle")
+        activeSessionType = nil
+        detectedAppName = nil
+        activeClient = nil
+        await sessionStore.endSession()
+        await transcriptLogger.discardSession()
+    }
+
     private func startSession(type: SessionType) {
+        if rejectStartIfBusy() { return }
         // If in side-by-side mode with a selected client, use client recording
         if clientRegistry.hasClients && clientRegistry.selectedClient != nil && type == .callCapture {
             startClientRecording()
             return
         }
+        isStarting = true
+        stopRequestedDuringStart = false
 
         transcriptStore.clear()
         silenceSeconds = 0
@@ -602,7 +792,8 @@ struct ContentView: View {
 
         let preCallNotes = editableContext
 
-        Task {
+        startTask = Task {
+            defer { isStarting = false }
             transcriptionEngine?.lastError = nil
             await sessionStore.startSession()
             do {
@@ -621,35 +812,47 @@ struct ContentView: View {
             if type == .callCapture && !preCallNotes.isEmpty {
                 await transcriptLogger.updateContext(preCallNotes)
             }
+            guard !stopRequestedDuringStart else { return }
             activeSessionType = type
             detectedAppName = resolvedAppName
             let corrector = buildVocabularyCorrector(client: nil)
+            let started: Bool
             if type == .callCapture {
-                await transcriptionEngine?.start(
+                started = await transcriptionEngine?.start(
                     locale: settings.locale,
                     inputDeviceID: settings.inputDeviceID,
                     appBundleID: appBundleID,
                     preferBuiltInMic: settings.preferBuiltInMicDuringCalls,
-                    vocabularyCorrector: corrector
-                )
+                    vocabularyCorrector: corrector,
+                    systemAudioPath: await transcriptLogger.currentAudioPath
+                ) ?? false
             } else {
-                await transcriptionEngine?.start(
+                started = await transcriptionEngine?.start(
                     locale: settings.locale,
                     inputDeviceID: settings.inputDeviceID,
                     micOnly: true,
                     vocabularyCorrector: corrector
-                )
+                ) ?? false
             }
+            if !started { await abandonFailedStart() }
         }
     }
 
     private func stopSession() {
+        guard !isSaving, isStarting || isRunning || activeSessionType != nil else { return }
+        isSaving = true
+        stopRequestedDuringStart = true
         activeSessionType = nil
         detectedAppName = nil
         silenceSeconds = 0
+        let pendingStart = startTask
+        startTask = nil
 
         Task {
             savedFileURL = nil
+            // Let an in-flight start finish first, so capture can't begin
+            // after this save completes. engine.stop() also waits for setup.
+            await pendingStart?.value
             await transcriptionEngine?.stop()
             await sessionStore.endSession()
             contextUpdateTask?.cancel()
@@ -681,15 +884,25 @@ struct ContentView: View {
 
             transcriptionEngine?.assetStatus = "Finalizing..."
             let savedPath = await transcriptLogger.finalizeFrontmatter()
+            if savedPath != nil {
+                // The note is saved; its temp audio isn't needed any more.
+                transcriptionEngine?.discardSessionAudio()
+            } else {
+                // Keep the audio and the recovery record; say so.
+                transcriptionEngine?.keepSessionAudioForRecovery()
+                transcriptionEngine?.lastError = "Couldn't finish saving the note. What was transcribed during the call is in it, and \(AppPaths.displayName) will try to finish it next time it opens."
+            }
             transcriptionEngine?.assetStatus = "Ready"
 
             transcriptStore.clear()
 
             if activeSessionType == nil, let savedPath {
+                savedFileWasRecovered = false
                 savedFileURL = savedPath
             }
 
             activeClient = nil
+            isSaving = false
         }
     }
 
@@ -773,5 +986,29 @@ struct ModelDownloadBanner: View {
                 .fill(Color.dSurface)
                 .shadow(color: .black.opacity(0.15), radius: 8, y: 2)
         )
+    }
+}
+
+/// Finishes what the previous run left unsaved, once per launch: notes of
+/// recordings that never saved, then their temp audio. Only things from
+/// before this launch, so a recording started meanwhile is never touched,
+/// and only once, so reopening the window mid-recording can't either.
+@MainActor
+enum LaunchRecovery {
+    /// Set when the app starts (DettoApp.init touches it).
+    static let launchedAt = Date()
+    private static var ran = false
+
+    static func runOnce() async -> TranscriptLogger.RecoveryResult {
+        guard !ran else { return TranscriptLogger.RecoveryResult() }
+        ran = true
+        let result = await TranscriptLogger.recoverInterruptedRecordings(startedBefore: launchedAt)
+        // If the records can't be listed, keep all audio rather than guess.
+        if let kept = TranscriptLogger.audioNamesInProgress() {
+            TranscriptionEngine.cleanupOrphanedAudioFiles(createdBefore: launchedAt, keeping: kept)
+        } else {
+            engineLog("[RECOVER] couldn't list recovery records; skipping temp audio cleanup")
+        }
+        return result
     }
 }

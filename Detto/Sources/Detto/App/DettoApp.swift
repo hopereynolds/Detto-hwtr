@@ -18,7 +18,9 @@ struct DettoApp: App {
 
     init() {
         DettoTheme.registerFonts()
-        TranscriptionEngine.cleanupOrphanedAudioFiles()
+        // Notes and temp audio left by a recording that never saved are
+        // handled once the window is up (LaunchRecovery in ContentView).
+        _ = LaunchRecovery.launchedAt
 
         // Bound MLX's Metal buffer cache. Without a limit, freed buffers from
         // each refinement pass stay resident and wired memory ratchets upward
@@ -46,7 +48,9 @@ struct DettoApp: App {
         .defaultSize(width: 340, height: 580)
         .commands {
             CommandGroup(after: .appInfo) {
-                CheckForUpdatesView(updater: updaterController.updater)
+                if AppPaths.updatesEnabled {
+                    CheckForUpdatesView(updater: updaterController.updater)
+                }
             }
         }
         Settings {
