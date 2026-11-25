@@ -773,6 +773,7 @@ final class TranscriptionEngine {
         let store = transcriptStore
         let storeSession = transcriptStore.session
         let asr = asrEngine
+        let vocabCorrector = self.corrector
         let micResampler = AudioBufferResampler()
 
         let (micSampleStream, micSampleCont) = AsyncStream<[Float]>.makeStream()
@@ -786,7 +787,9 @@ final class TranscriptionEngine {
 
         Task {
             guard let micVadManager = try? await modelManager.makeVadManager() else {
+                // The mic still looks live, but nothing turns it into text.
                 engineLog("[ENGINE-MIC-SWAP] VAD creation failed")
+                self.lastError = "Mic transcription failed — restart session"
                 return
             }
             let micVad = VADProcessor(vadManager: micVadManager)
@@ -802,7 +805,14 @@ final class TranscriptionEngine {
                         engineLog("[MIC] ASR returned nil")
                         return
                     }
-                    let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let rawText = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let corrected = vocabCorrector?.correct(rawText)
+                    let text = corrected?.text ?? rawText
+                    if let corrected, !corrected.corrections.isEmpty {
+                        for c in corrected.corrections {
+                            engineLog("[VOCAB] \(c.rule): \"\(c.original)\" -> \"\(c.corrected)\"")
+                        }
+                    }
                     let asrMs = Int(Date().timeIntervalSince(asrStart) * 1000)
                     guard !text.isEmpty else {
                         engineLog("[MIC] ASR returned empty text (\(asrMs)ms)")
