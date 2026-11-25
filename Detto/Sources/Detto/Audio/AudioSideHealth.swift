@@ -34,8 +34,11 @@ enum AudioSideHealth: Equatable {
         return .live
     }
 
-    static func call(isCallCapture: Bool, stopped: Bool, reconnecting: Bool, hasAudio: Bool, secondsSinceSound: Double?) -> AudioSideHealth {
+    /// `unavailable`: the recording started without call audio (e.g. no
+    /// Screen Recording permission), so it will never arrive.
+    static func call(isCallCapture: Bool, unavailable: Bool = false, stopped: Bool, reconnecting: Bool, hasAudio: Bool, secondsSinceSound: Double?) -> AudioSideHealth {
         guard isCallCapture else { return .off }
+        if unavailable { return .lost }
         if stopped { return reconnecting ? .reconnecting : .lost }
         guard hasAudio else { return .starting }
         if let quiet = secondsSinceSound, quiet >= callQuietAfter { return .quiet(seconds: Int(quiet)) }

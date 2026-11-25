@@ -121,7 +121,7 @@ final class TranscriptionEngine {
 
     /// True while start() is still setting up. stop() waits for it, so a
     /// quick Start-then-Stop can't leave half a session running.
-    private var isStarting = false
+    private(set) var isStarting = false
 
     // GrembleVoice engines
     private let modelManager: ParakeetModelManager
@@ -145,6 +145,16 @@ final class TranscriptionEngine {
     /// Keeps the mic stream alive for the audio level meter when transcription isn't running.
     private var micKeepAliveTask: Task<Void, Never>?
     private var micWatchdogTask: Task<Void, Never>?
+    /// Bumped by every mic reopen and by Stop. A reopen's speech-detection
+    /// setup finishes asynchronously; it installs its transcription task
+    /// (or reports a failure) only if it's still the current attempt.
+    private var micAttempt = 0
+    /// The current reopen's speech-detection setup, cancelled by the next
+    /// reopen and by Stop.
+    private var micVadSetupTask: Task<Void, Never>?
+    /// Set when the user picks a different mic, so the watchdog gives the
+    /// new device its full retry budget.
+    private var micRetriesNeedReset = false
 
     /// What the mic is doing, for the toolbar. Kept apart from lastError.
     enum MicStatus { case starting, live, reconnecting, lost }
@@ -400,8 +410,13 @@ final class TranscriptionEngine {
 
             let asr = asrEngine
             let vocabCorrector = self.corrector
+            let attempt = micAttempt
             let reportMicError: @Sendable (String) -> Void = { [weak self] msg in
-                Task { @MainActor in self?.lastError = msg }
+                Task { @MainActor in
+                    // Only while this mic pipeline is still the current one.
+                    guard let self, self.isRunning, self.micAttempt == attempt else { return }
+                    self.lastError = msg
+                }
             }
             micTranscribeTask = Task.detached {
                 let hadFatalError = await micVad.run(stream: micSampleStream) { segment in
@@ -694,18 +709,29 @@ final class TranscriptionEngine {
     /// automatic). The saved Settings choice is left alone, so the next
     /// recording starts as usual. The call audio keeps recording.
     func switchMic(to deviceID: AudioDeviceID) {
-        guard isRunning else { return }
+        guard canUseMicControls else { return }
         engineLog("[ENGINE-PANEL] switch mic to \(deviceID == 0 ? "automatic" : String(deviceID))")
+        // A default-input change may have queued a switch back to
+        // Automatic; the user's pick wins.
+        deviceRestartTask?.cancel()
+        deviceRestartTask = nil
         let before = currentMicDeviceID
         restartMic(inputDeviceID: deviceID)
         // A switch to the device already in use only changes the choice.
-        if currentMicDeviceID != before { markManualMicAttempt() }
+        if currentMicDeviceID != before {
+            micRetriesNeedReset = true
+            markManualMicAttempt()
+        }
     }
+
+    /// The panel's mic controls work once Start has finished setting up
+    /// (the pipeline and the watchdog exist).
+    var canUseMicControls: Bool { isRunning && !isStarting }
 
     /// Reopens the current mic, even when it looks fine (e.g. it's only
     /// sending silence). The call audio keeps recording.
     func reconnectMic() {
-        guard isRunning else { return }
+        guard canUseMicControls else { return }
         engineLog("[ENGINE-PANEL] reconnect mic")
         restartMic(inputDeviceID: userSelectedDeviceID, force: true)
         markManualMicAttempt()
@@ -722,7 +748,19 @@ final class TranscriptionEngine {
     /// The call audio can be reconnected by hand: a call recording whose
     /// pipeline is attached, with no reconnect already running.
     var canReconnectCallAudio: Bool {
-        isRunning && sessionIsCallCapture && systemConsumerAttached && systemRestartTask == nil
+        isRunning && !isStarting && sessionIsCallCapture && systemConsumerAttached && systemRestartTask == nil
+    }
+
+    /// What the call recorder actually captures, once its pipeline is
+    /// attached. A requested app that wasn't found means all Mac audio.
+    var callAudioScope: SystemAudioCapture.Scope? {
+        systemConsumerAttached ? systemCapture.scope : nil
+    }
+
+    /// A call recording finished starting without its call-audio pipeline
+    /// (no Screen Recording permission, or the capture failed to open).
+    var callAudioUnavailable: Bool {
+        isRunning && !isStarting && sessionIsCallCapture && !systemConsumerAttached
     }
 
     /// Replaces the call-audio stream, even one that looks fine (e.g. it's
@@ -757,9 +795,13 @@ final class TranscriptionEngine {
 
         micReaderTask?.cancel()
         micTranscribeTask?.cancel()
+        micVadSetupTask?.cancel()
         micReaderTask = nil
         micTranscribeTask = nil
+        micVadSetupTask = nil
         micCapture.stop()
+        micAttempt += 1
+        let attempt = micAttempt
 
         currentMicDeviceID = resolvedMicID
         micAttemptStartedAt = Date()
@@ -785,8 +827,12 @@ final class TranscriptionEngine {
             micSampleCont.finish()
         }
 
-        Task {
-            guard let micVadManager = try? await modelManager.makeVadManager() else {
+        micVadSetupTask = Task { [weak self] in
+            let micVadManager = try? await self?.modelManager.makeVadManager()
+            // A newer reopen or Stop took over while this was setting up.
+            guard let self, !Task.isCancelled, self.isRunning, self.micAttempt == attempt else { return }
+            self.micVadSetupTask = nil
+            guard let micVadManager else {
                 // The mic still looks live, but nothing turns it into text.
                 engineLog("[ENGINE-MIC-SWAP] VAD creation failed")
                 self.lastError = "Mic transcription failed — restart session"
@@ -795,7 +841,10 @@ final class TranscriptionEngine {
             let micVad = VADProcessor(vadManager: micVadManager)
 
             let reportMicError: @Sendable (String) -> Void = { [weak self] msg in
-                Task { @MainActor in self?.lastError = msg }
+                Task { @MainActor in
+                    guard let self, self.isRunning, self.micAttempt == attempt else { return }
+                    self.lastError = msg
+                }
             }
             self.micTranscribeTask = Task.detached {
                 let hadFatalError = await micVad.run(stream: micSampleStream) { segment in
@@ -934,7 +983,8 @@ final class TranscriptionEngine {
                 self.deviceRestartTask?.cancel()
                 self.deviceRestartTask = Task {
                     try? await Task.sleep(for: .seconds(3))
-                    guard !Task.isCancelled else { return }
+                    // The user may have picked a mic meanwhile; keep it.
+                    guard !Task.isCancelled, self.userSelectedDeviceID == 0 else { return }
                     self.restartMic(inputDeviceID: 0)
                 }
             }
@@ -1039,6 +1089,10 @@ final class TranscriptionEngine {
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(1))
                 guard let self, self.isRunning, !Task.isCancelled else { return }
+                if self.micRetriesNeedReset {
+                    self.micRetriesNeedReset = false
+                    retries = 0
+                }
                 let mic = self.micCapture
                 if mic.tapIsActive {
                     if self.micStatus != .live {
@@ -1101,6 +1155,10 @@ final class TranscriptionEngine {
         sysLoopTask?.cancel()
         diarUpdateTask?.cancel()
         micKeepAliveTask?.cancel()
+        micVadSetupTask?.cancel()
+        micVadSetupTask = nil
+        micAttempt += 1
+        micRetriesNeedReset = false
         micWatchdogTask?.cancel()
         micWatchdogTask = nil
         micAttemptStartedAt = nil

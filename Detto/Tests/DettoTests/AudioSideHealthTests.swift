@@ -36,6 +36,10 @@ final class AudioSideHealthTests: XCTestCase {
         XCTAssertEqual(AudioSideHealth.call(isCallCapture: true, stopped: true, reconnecting: false, hasAudio: false, secondsSinceSound: nil), .lost)
     }
 
+    func testCallAudioThatNeverStartedIsLost() {
+        XCTAssertEqual(AudioSideHealth.call(isCallCapture: true, unavailable: true, stopped: false, reconnecting: false, hasAudio: false, secondsSinceSound: nil), .lost)
+    }
+
     func testCallWaitsLongerBeforeCallingItSilent() {
         XCTAssertEqual(AudioSideHealth.call(isCallCapture: true, stopped: false, reconnecting: false, hasAudio: false, secondsSinceSound: nil), .starting)
         XCTAssertEqual(AudioSideHealth.call(isCallCapture: true, stopped: false, reconnecting: false, hasAudio: true, secondsSinceSound: 59), .live)

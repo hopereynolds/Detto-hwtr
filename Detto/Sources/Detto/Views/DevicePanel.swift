@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import CoreAudio
 
 /// Mid-recording audio panel: which mic and output are in use, a level
@@ -7,8 +8,6 @@ import CoreAudio
 /// later.
 struct DevicePanel: View {
     let engine: TranscriptionEngine
-    /// The app the call audio is captured from; nil means all Mac audio.
-    let sourceAppName: String?
 
     @AppStorage("devicePanelExpanded") private var expanded = true
     @State private var inputs: [AudioDeviceInfo] = []
@@ -43,6 +42,7 @@ struct DevicePanel: View {
     private var callHealth: AudioSideHealth {
         .call(
             isCallCapture: engine.sessionIsCallCapture,
+            unavailable: engine.callAudioUnavailable,
             stopped: engine.systemAudioStopped,
             reconnecting: engine.systemAudioReconnecting,
             hasAudio: engine.systemHasAudio,
@@ -115,10 +115,11 @@ struct DevicePanel: View {
                 .controlSize(.small)
                 .font(.dMono(size: 10, weight: .medium))
                 .frame(maxWidth: .infinity, alignment: .leading)
+                .disabled(!engine.canUseMicControls)
                 .help("Pick another mic for the rest of this recording. The call audio keeps recording.")
                 .accessibilityLabel("Microphone for this recording")
 
-                reconnectButton("Reconnect mic", disabled: health == .reconnecting || health == .starting) {
+                reconnectButton("Reconnect mic", disabled: !engine.canUseMicControls || health == .reconnecting || health == .starting) {
                     engine.reconnectMic()
                 }
             }
@@ -176,8 +177,8 @@ struct DevicePanel: View {
             sideHeader("CALL", health: health, rms: engine.systemRMS, meterLabel: "Call audio level")
             HStack(spacing: 8) {
                 VStack(alignment: .leading, spacing: 2) {
-                    detailText("From: \(sourceAppName ?? "all Mac audio")")
-                    detailText("You hear it on: \(output?.displayName ?? "unknown")")
+                    detailText("Recording: \(scopeLabel)")
+                    detailText("Mac default output: \(output?.displayName ?? "unknown")")
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 reconnectButton("Reconnect call audio", disabled: !engine.canReconnectCallAudio) {
@@ -188,10 +189,26 @@ struct DevicePanel: View {
         }
     }
 
+    /// What the call recorder actually opened, not what was asked for:
+    /// a requested app that wasn't found means all Mac audio.
+    private var scopeLabel: String {
+        switch engine.callAudioScope {
+        case .app(let bundleID):
+            let name = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first?.localizedName
+            return "\(name ?? bundleID) only"
+        case .allSystemAudio:
+            return "all Mac audio"
+        case nil:
+            return engine.callAudioUnavailable ? "nothing" : "starting…"
+        }
+    }
+
     private func callWarning(_ health: AudioSideHealth) -> String? {
         switch health {
         case .quiet(let seconds):
             return "No sound from the call for \(AudioSideHealth.duration(seconds)). If people are talking, press Reconnect."
+        case .lost where engine.callAudioUnavailable:
+            return "Call audio isn't being recorded. See the message above."
         case .lost:
             return "Call audio stopped. Press Reconnect to try again."
         default:

@@ -457,7 +457,7 @@ struct ContentView: View {
     @ViewBuilder
     private var devicePanel: some View {
         if isRunning, let engine = transcriptionEngine {
-            DevicePanel(engine: engine, sourceAppName: detectedAppName)
+            DevicePanel(engine: engine)
         }
     }
 

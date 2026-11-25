@@ -48,11 +48,14 @@ final class MicCapture: @unchecked Sendable {
     static let soundFloor: Float = 0.0001
 
     var audioLevel: Float { _audioLevel.value }
-    /// Raw RMS of the latest buffer (0...1).
-    var rms: Float { _rms.value }
+    /// Raw RMS of the latest buffer (0...1); 0 while the current capture
+    /// isn't delivering, so a stalled or replaced one can't freeze the
+    /// meter (a retired callback's last write is ignored too).
+    var rms: Float { tapIsActive ? _rms.value : 0 }
     /// Seconds the current capture has been delivering nothing but
     /// silence, or nil before its first buffer.
     var secondsSinceSound: Double? {
+        guard hasDelivered else { return nil }
         let last = _lastSoundAt.withLock { $0 }
         guard last > 0 else { return nil }
         return Double(DispatchTime.now().uptimeNanoseconds &- last) / 1_000_000_000
