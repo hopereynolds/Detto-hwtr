@@ -90,6 +90,18 @@ final class TranscriptionEngine {
     var micIsLive: Bool { micCapture.tapIsActive }
     /// Computer audio has delivered audio, or this session doesn't capture it.
     var systemIsLive: Bool { !sessionIsCallCapture || systemCapture.hasAudio }
+    // Per-side readings for the device panel. Not observable: poll them.
+    /// Raw RMS of the mic's latest buffer.
+    var micRMS: Float { micCapture.rms }
+    /// Raw RMS of the call audio's latest buffer.
+    var systemRMS: Float { systemCapture.rms }
+    /// Seconds the mic has delivered only silence (nil before its first buffer).
+    var micSecondsSinceSound: Double? { micCapture.secondsSinceSound }
+    /// Seconds the call audio has carried only silence (nil before its first buffer).
+    var systemSecondsSinceSound: Double? { systemCapture.secondsSinceSound }
+    /// The current call-audio stream is delivering.
+    var systemHasAudio: Bool { systemCapture.hasAudio }
+
     /// macOS stopped the call-audio stream during this session and it
     /// hasn't come back yet.
     private(set) var systemAudioStopped = false
@@ -167,10 +179,10 @@ final class TranscriptionEngine {
     private var currentDiarSegments: [DiarizedSegment] = []
 
     /// Tracks the resolved mic device ID currently in use.
-    private var currentMicDeviceID: AudioDeviceID = 0
+    private(set) var currentMicDeviceID: AudioDeviceID = 0
 
     /// Tracks whether user selected "System Default" (0) or a specific device.
-    private var userSelectedDeviceID: AudioDeviceID = 0
+    private(set) var userSelectedDeviceID: AudioDeviceID = 0
 
     /// When true and capturing a call on the system-default input, a Bluetooth
     /// default input is swapped for the built-in mic to avoid contending with
@@ -178,7 +190,7 @@ final class TranscriptionEngine {
     private var preferBuiltInMicDuringCalls = false
 
     /// Whether the current session captures system audio (call capture).
-    private var sessionIsCallCapture = false
+    private(set) var sessionIsCallCapture = false
 
     /// Listens for default input device changes at the OS level.
     private var defaultDeviceListenerBlock: AudioObjectPropertyListenerBlock?
@@ -676,6 +688,56 @@ final class TranscriptionEngine {
         }
     }
 
+    // MARK: - Manual controls (device panel)
+
+    /// Records from `deviceID` for the rest of this recording (0 means
+    /// automatic). The saved Settings choice is left alone, so the next
+    /// recording starts as usual. The call audio keeps recording.
+    func switchMic(to deviceID: AudioDeviceID) {
+        guard isRunning else { return }
+        engineLog("[ENGINE-PANEL] switch mic to \(deviceID == 0 ? "automatic" : String(deviceID))")
+        let before = currentMicDeviceID
+        restartMic(inputDeviceID: deviceID)
+        // A switch to the device already in use only changes the choice.
+        if currentMicDeviceID != before { markManualMicAttempt() }
+    }
+
+    /// Reopens the current mic, even when it looks fine (e.g. it's only
+    /// sending silence). The call audio keeps recording.
+    func reconnectMic() {
+        guard isRunning else { return }
+        engineLog("[ENGINE-PANEL] reconnect mic")
+        restartMic(inputDeviceID: userSelectedDeviceID, force: true)
+        markManualMicAttempt()
+    }
+
+    /// A manual reopen shows RECONNECTING MIC even from MIC LOST. The
+    /// watchdog then judges it like any other attempt: LIVE when audio
+    /// arrives, a retry or MIC LOST when it doesn't.
+    private func markManualMicAttempt() {
+        micStatus = .reconnecting
+        refreshLossMessage()
+    }
+
+    /// The call audio can be reconnected by hand: a call recording whose
+    /// pipeline is attached, with no reconnect already running.
+    var canReconnectCallAudio: Bool {
+        isRunning && sessionIsCallCapture && systemConsumerAttached && systemRestartTask == nil
+    }
+
+    /// Replaces the call-audio stream, even one that looks fine (e.g. it's
+    /// only delivering silence), or tries again after CALL AUDIO LOST.
+    /// Same path as an automatic reconnect: same app filter, the gap is
+    /// filled with silence, the mic keeps recording.
+    func reconnectCallAudio() {
+        guard canReconnectCallAudio else { return }
+        engineLog("[ENGINE-PANEL] reconnect call audio")
+        systemAudioStopped = true
+        systemAudioReconnecting = true
+        startSystemRestart()
+        refreshLossMessage()
+    }
+
     /// Restart only the mic capture with a new device, keeping system audio and models intact.
     /// `force` restarts even on the same device (to recover a stalled mic).
     func restartMic(inputDeviceID: AudioDeviceID, force: Bool = false) {
@@ -711,6 +773,7 @@ final class TranscriptionEngine {
         let store = transcriptStore
         let storeSession = transcriptStore.session
         let asr = asrEngine
+        let vocabCorrector = self.corrector
         let micResampler = AudioBufferResampler()
 
         let (micSampleStream, micSampleCont) = AsyncStream<[Float]>.makeStream()
@@ -724,7 +787,9 @@ final class TranscriptionEngine {
 
         Task {
             guard let micVadManager = try? await modelManager.makeVadManager() else {
+                // The mic still looks live, but nothing turns it into text.
                 engineLog("[ENGINE-MIC-SWAP] VAD creation failed")
+                self.lastError = "Mic transcription failed — restart session"
                 return
             }
             let micVad = VADProcessor(vadManager: micVadManager)
@@ -740,7 +805,14 @@ final class TranscriptionEngine {
                         engineLog("[MIC] ASR returned nil")
                         return
                     }
-                    let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let rawText = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let corrected = vocabCorrector?.correct(rawText)
+                    let text = corrected?.text ?? rawText
+                    if let corrected, !corrected.corrections.isEmpty {
+                        for c in corrected.corrections {
+                            engineLog("[VOCAB] \(c.rule): \"\(c.original)\" -> \"\(c.corrected)\"")
+                        }
+                    }
                     let asrMs = Int(Date().timeIntervalSince(asrStart) * 1000)
                     guard !text.isEmpty else {
                         engineLog("[MIC] ASR returned empty text (\(asrMs)ms)")

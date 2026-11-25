@@ -266,6 +266,7 @@ struct ContentView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.horizontal, 14).padding(.vertical, 2)
                 }
+                devicePanel
                 WaveformView(isRecording: true, audioLevel: audioLevel)
                 wideStopBar
             }
@@ -305,6 +306,7 @@ struct ContentView: View {
                         .padding(.horizontal, 14).padding(.vertical, 2)
                 }
 
+                devicePanel
                 WaveformView(isRecording: true, audioLevel: audioLevel)
                 wideStopBar
             }
@@ -426,6 +428,8 @@ struct ContentView: View {
                 saveBanner(url: url)
             }
 
+            devicePanel
+
             WaveformView(isRecording: isRunning, audioLevel: audioLevel)
 
             ControlBar(
@@ -444,6 +448,17 @@ struct ContentView: View {
             )
         }
         .frame(minWidth: 280, minHeight: 400)
+    }
+
+    // MARK: - Device Panel
+
+    /// Which mic and output are in use, with meters and fixes, while
+    /// recording.
+    @ViewBuilder
+    private var devicePanel: some View {
+        if isRunning, let engine = transcriptionEngine {
+            DevicePanel(engine: engine, sourceAppName: detectedAppName)
+        }
     }
 
     // MARK: - Detto Toolbar
