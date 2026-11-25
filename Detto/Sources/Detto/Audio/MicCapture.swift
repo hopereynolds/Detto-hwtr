@@ -113,17 +113,26 @@ final class MicCapture: @unchecked Sendable {
         func deliver(_ buffer: AVAudioPCMBuffer) {
             lock.lock()
             defer { lock.unlock() }
-            guard alive, generationLock.withLock({ $0 == generation }) else { return }
-            count += 1
-            let now = DispatchTime.now().uptimeNanoseconds
-            lastBufferAt.withLock { $0 = now }
-            if count == 1 { tapActive.value = true }
+            guard alive else { return }
             let rms = MicCapture.normalizedRMS(from: buffer)
-            if count == 1 || rms >= MicCapture.soundFloor {
-                lastSoundAt.withLock { $0 = now }
+            // Check the generation and publish under the generation lock,
+            // so a reopen or Stop (which bump it and reset these in the
+            // same step) can't be overtaken by a retired source's buffer.
+            let first = count == 0
+            let accepted = generationLock.withLock { current -> Bool in
+                guard current == generation else { return false }
+                let now = DispatchTime.now().uptimeNanoseconds
+                lastBufferAt.withLock { $0 = now }
+                if first { tapActive.value = true }
+                if first || rms >= MicCapture.soundFloor {
+                    lastSoundAt.withLock { $0 = now }
+                }
+                level.value = min(rms * 25, 1.0)
+                rmsHolder.value = rms
+                return true
             }
-            level.value = min(rms * 25, 1.0)
-            rmsHolder.value = rms
+            guard accepted else { return }
+            count += 1
             if count <= 5 || count % 100 == 0 {
                 engineLog("[MIC-6] \(label) #\(count): frames=\(buffer.frameLength) rms=\(rms) level=\(level.value)")
             }
@@ -144,11 +153,11 @@ final class MicCapture: @unchecked Sendable {
     func bufferStream(deviceID: AudioDeviceID? = nil) -> AsyncStream<AVAudioPCMBuffer> {
         let errorHolder = _error
         let tapActive = _tapActive
-        tapActive.value = false
-        _lastBufferAt.withLock { $0 = 0 }
-        _lastSoundAt.withLock { $0 = 0 }
-        _rms.value = 0
-        let generation = _generation.withLock { value -> Int in value += 1; return value }
+        let generation = _generation.withLock { value -> Int in
+            value += 1
+            resetReadings()
+            return value
+        }
 
         return AsyncStream { continuation in
             errorHolder.value = nil
@@ -358,7 +367,15 @@ final class MicCapture: @unchecked Sendable {
     }
 
     private func beginStop() {
-        _generation.withLock { $0 += 1 }
+        _generation.withLock { value in
+            value += 1
+            resetReadings()
+        }
+    }
+
+    /// Clears what the panel and watchdog read. Only inside the generation
+    /// lock, in the same step that retires the current source.
+    private func resetReadings() {
         _lastBufferAt.withLock { $0 = 0 }
         _lastSoundAt.withLock { $0 = 0 }
         _audioLevel.value = 0

@@ -155,6 +155,9 @@ final class TranscriptionEngine {
     /// Set when the user picks a different mic, so the watchdog gives the
     /// new device its full retry budget.
     private var micRetriesNeedReset = false
+    /// A mic change (e.g. from Settings) that arrived while Start was still
+    /// setting up; applied once it's done, so two setups never compete.
+    private var pendingMicChange: AudioDeviceID?
 
     /// What the mic is doing, for the toolbar. Kept apart from lastError.
     enum MicStatus { case starting, live, reconnecting, lost }
@@ -283,6 +286,7 @@ final class TranscriptionEngine {
         guard !isRunning, !isStarting else { return false }
         isStarting = true
         defer { isStarting = false }
+        pendingMicChange = nil
         lastError = nil
         preferBuiltInMicDuringCalls = preferBuiltInMic
         sessionIsCallCapture = !micOnly
@@ -624,6 +628,13 @@ final class TranscriptionEngine {
 
         installDefaultDeviceListener()
         startMicWatchdog()
+        // `isStarting` is still true until this returns; clear it first so
+        // the deferred change isn't deferred again.
+        if let pending = pendingMicChange {
+            pendingMicChange = nil
+            isStarting = false
+            restartMic(inputDeviceID: pending)
+        }
         return true
     }
 
@@ -779,7 +790,13 @@ final class TranscriptionEngine {
     /// Restart only the mic capture with a new device, keeping system audio and models intact.
     /// `force` restarts even on the same device (to recover a stalled mic).
     func restartMic(inputDeviceID: AudioDeviceID, force: Bool = false) {
-        guard isRunning, let asrEngine else { return }
+        guard isRunning else { return }
+        guard !isStarting else {
+            engineLog("[ENGINE-MIC-SWAP] mic change to \(inputDeviceID) while starting; applying it once start finishes")
+            pendingMicChange = inputDeviceID
+            return
+        }
+        guard let asrEngine else { return }
 
         if inputDeviceID != 0 || userSelectedDeviceID != 0 {
             userSelectedDeviceID = inputDeviceID
@@ -1159,6 +1176,7 @@ final class TranscriptionEngine {
         micVadSetupTask = nil
         micAttempt += 1
         micRetriesNeedReset = false
+        pendingMicChange = nil
         micWatchdogTask?.cancel()
         micWatchdogTask = nil
         micAttemptStartedAt = nil
