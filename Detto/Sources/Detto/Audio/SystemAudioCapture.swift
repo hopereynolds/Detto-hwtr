@@ -39,6 +39,11 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
     private let _state = OSAllocatedUnfairLock<State>(uncheckedState: State())
     private let _micContinuation = OSAllocatedUnfairLock<AsyncStream<AVAudioPCMBuffer>.Continuation?>(uncheckedState: nil)
     private let _audioLevel = AudioLevel()
+    /// Raw RMS of the latest buffer, for the device panel's meter.
+    private let _rms = AudioLevel()
+    /// Uptime (ns) of the last buffer with sound in it, or of the current
+    /// stream's first buffer; 0 before any.
+    private let _lastSoundAt = OSAllocatedUnfairLock<UInt64>(initialState: 0)
     /// Serial, so a replacement's gap silence and first buffer go out
     /// before anything that follows them.
     private let sampleQueue = DispatchQueue(label: "detto.system-audio", qos: .userInteractive)
@@ -46,6 +51,21 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
     private static let maxGapFill: TimeInterval = 120
 
     var audioLevel: Float { _audioLevel.value }
+    /// Raw RMS of the latest buffer (0...1).
+    var rms: Float { _rms.value }
+    /// Seconds the call audio has carried nothing but silence, or nil
+    /// before its first buffer. Silence is normal when nobody's talking.
+    var secondsSinceSound: Double? {
+        let last = _lastSoundAt.withLock { $0 }
+        guard last > 0 else { return nil }
+        return Double(DispatchTime.now().uptimeNanoseconds &- last) / 1_000_000_000
+    }
+
+    private func resetLevels() {
+        _audioLevel.value = 0
+        _rms.value = 0
+        _lastSoundAt.withLock { $0 = 0 }
+    }
     /// True once the current stream has delivered audio, until it stops.
     var hasAudio: Bool { _state.withLock { $0.hasAudio } }
     /// Identifies the current recording; stop-notices carry it.
@@ -92,6 +112,7 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
             return (generation, previous)
         }
         previous?.finish()
+        resetLevels()
         try await open(generation: generation, requestedAppBundleID: appBundleID)
         return CaptureStreams(systemAudio: sysStream)
     }
@@ -245,7 +266,7 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
             return taken
         }
         continuation?.finish()
-        _audioLevel.value = 0
+        resetLevels()
         try? await stream?.stopCapture()
         // An open in flight stops its own stream once it sees Stop, and a
         // close in flight finishes on its own; wait for both (up to 5 s)
@@ -312,6 +333,10 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
         // Update audio level for visualizer
         let rms = Self.normalizedRMS(from: pcmBuffer)
         _audioLevel.value = min(rms * 25, 1.0)
+        _rms.value = rms
+        if count == 1 || rms >= MicCapture.soundFloor {
+            _lastSoundAt.withLock { $0 = DispatchTime.now().uptimeNanoseconds }
+        }
 
         // Diagnostic: log raw system audio levels periodically
         if count <= 5 || count % 200 == 0 {
@@ -365,6 +390,7 @@ final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamDelegate,
         }
         engineLog("[SYS-STOP] stream stopped with error: \(error)")
         _audioLevel.value = 0
+        _rms.value = 0
         // Keep the consumer's stream open: restart() feeds it again.
         _onStreamStopped.withLock { $0 }?(generation, error)
     }

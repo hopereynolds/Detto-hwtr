@@ -17,6 +17,8 @@ final class MicCapture: @unchecked Sendable {
     /// Serializes engine setup and teardown, off the main thread.
     private let queue = DispatchQueue(label: "detto.mic-capture", qos: .userInitiated)
     private let _audioLevel = AudioLevel()
+    /// Raw RMS of the latest buffer, for the device panel's meter.
+    private let _rms = AudioLevel()
     private let _error = SyncString()
     private let _tapActive = AtomicBool()
     /// Bumped by every bufferStream() and stop(). Setup work and tap
@@ -36,7 +38,25 @@ final class MicCapture: @unchecked Sendable {
     /// arrive every 20-90 ms.
     static let stallThreshold: Double = 1.5
 
+    /// Uptime (ns) of the last buffer with sound in it (or of the first
+    /// buffer); 0 before the first.
+    private let _lastSoundAt = OSAllocatedUnfairLock<UInt64>(initialState: 0)
+
+    /// Quieter than this (about -80 dBFS) is no sound at all. A working
+    /// mic's room noise sits well above it; a dead or muted one sends
+    /// zeros.
+    static let soundFloor: Float = 0.0001
+
     var audioLevel: Float { _audioLevel.value }
+    /// Raw RMS of the latest buffer (0...1).
+    var rms: Float { _rms.value }
+    /// Seconds the current capture has been delivering nothing but
+    /// silence, or nil before its first buffer.
+    var secondsSinceSound: Double? {
+        let last = _lastSoundAt.withLock { $0 }
+        guard last > 0 else { return nil }
+        return Double(DispatchTime.now().uptimeNanoseconds &- last) / 1_000_000_000
+    }
     var captureError: String? { _error.value }
     /// The current capture has delivered at least one buffer.
     var hasDelivered: Bool { _tapActive.value }
@@ -66,19 +86,24 @@ final class MicCapture: @unchecked Sendable {
         private let generationLock: OSAllocatedUnfairLock<Int>
         private let tapActive: AtomicBool
         private let lastBufferAt: OSAllocatedUnfairLock<UInt64>
+        private let lastSoundAt: OSAllocatedUnfairLock<UInt64>
         private let level: AudioLevel
+        private let rmsHolder: AudioLevel
         private let continuation: AsyncStream<AVAudioPCMBuffer>.Continuation
         private let label: String
 
         init(label: String, generation: Int, generationLock: OSAllocatedUnfairLock<Int>, tapActive: AtomicBool,
-             lastBufferAt: OSAllocatedUnfairLock<UInt64>, level: AudioLevel,
+             lastBufferAt: OSAllocatedUnfairLock<UInt64>, lastSoundAt: OSAllocatedUnfairLock<UInt64>,
+             level: AudioLevel, rms: AudioLevel,
              continuation: AsyncStream<AVAudioPCMBuffer>.Continuation) {
             self.label = label
             self.generation = generation
             self.generationLock = generationLock
             self.tapActive = tapActive
             self.lastBufferAt = lastBufferAt
+            self.lastSoundAt = lastSoundAt
             self.level = level
+            self.rmsHolder = rms
             self.continuation = continuation
         }
 
@@ -87,10 +112,15 @@ final class MicCapture: @unchecked Sendable {
             defer { lock.unlock() }
             guard alive, generationLock.withLock({ $0 == generation }) else { return }
             count += 1
-            lastBufferAt.withLock { $0 = DispatchTime.now().uptimeNanoseconds }
+            let now = DispatchTime.now().uptimeNanoseconds
+            lastBufferAt.withLock { $0 = now }
             if count == 1 { tapActive.value = true }
             let rms = MicCapture.normalizedRMS(from: buffer)
+            if count == 1 || rms >= MicCapture.soundFloor {
+                lastSoundAt.withLock { $0 = now }
+            }
             level.value = min(rms * 25, 1.0)
+            rmsHolder.value = rms
             if count <= 5 || count % 100 == 0 {
                 engineLog("[MIC-6] \(label) #\(count): frames=\(buffer.frameLength) rms=\(rms) level=\(level.value)")
             }
@@ -104,7 +134,8 @@ final class MicCapture: @unchecked Sendable {
 
     private func makeSink(_ label: String, generation: Int, continuation: AsyncStream<AVAudioPCMBuffer>.Continuation) -> BufferSink {
         BufferSink(label: label, generation: generation, generationLock: _generation, tapActive: _tapActive,
-                   lastBufferAt: _lastBufferAt, level: _audioLevel, continuation: continuation)
+                   lastBufferAt: _lastBufferAt, lastSoundAt: _lastSoundAt, level: _audioLevel, rms: _rms,
+                   continuation: continuation)
     }
 
     func bufferStream(deviceID: AudioDeviceID? = nil) -> AsyncStream<AVAudioPCMBuffer> {
@@ -112,6 +143,8 @@ final class MicCapture: @unchecked Sendable {
         let tapActive = _tapActive
         tapActive.value = false
         _lastBufferAt.withLock { $0 = 0 }
+        _lastSoundAt.withLock { $0 = 0 }
+        _rms.value = 0
         let generation = _generation.withLock { value -> Int in value += 1; return value }
 
         return AsyncStream { continuation in
@@ -324,7 +357,9 @@ final class MicCapture: @unchecked Sendable {
     private func beginStop() {
         _generation.withLock { $0 += 1 }
         _lastBufferAt.withLock { $0 = 0 }
+        _lastSoundAt.withLock { $0 = 0 }
         _audioLevel.value = 0
+        _rms.value = 0
         _tapActive.value = false
     }
 
