@@ -6,15 +6,15 @@ struct SettingsView: View {
     @Bindable var settings: AppSettings
     var updater: SPUUpdater
     var dictationController: DictationController
-    @State private var inputDevices: [(id: AudioDeviceID, name: String)] = []
+    @State private var inputDevices: [AudioDeviceInfo] = []
 
     var body: some View {
         Form {
             Section {
                 Picker("Microphone", selection: $settings.inputDeviceID) {
                     Text("System Default").tag(AudioDeviceID(0))
-                    ForEach(inputDevices, id: \.id) { device in
-                        Text(device.name).tag(device.id)
+                    ForEach(inputDevices) { device in
+                        Text(device.displayName).tag(device.id)
                     }
                 }
                 .font(.dMono(size: 12, weight: .medium))
@@ -153,7 +153,7 @@ struct SettingsView: View {
         .frame(width: 450, height: 700)
         .tint(Color.dAmber)
         .onAppear {
-            inputDevices = MicCapture.availableInputDevices()
+            inputDevices = AudioDeviceInfo.inputs()
         }
     }
 
